@@ -32,10 +32,11 @@ def pct_change(old, new):
     return (new - old) / old * 100
 
 
-def classify(prem_old, prem_new, oi_old, oi_new, spot_dir, opt_type):
+def classify(prem_old, prem_new, oi_old, oi_new, spot_dir, opt_type, strike=None, spot=None):
     """
     Returns (event_type, bias, detail) or None.
     spot_dir: +1 up, -1 down, 0 flat. opt_type: 'CE'|'PE'.
+    strike/spot: used to require OTM for wall logic (ITM writing != resistance).
     """
     if prem_new < PREMIUM_FLOOR:
         return None
@@ -49,30 +50,33 @@ def classify(prem_old, prem_new, oi_old, oi_new, spot_dir, opt_type):
     aligned = (opt_type == "CE" and spot_dir > 0) or (opt_type == "PE" and spot_dir < 0)
     bias = "BULLISH" if opt_type == "CE" else "BEARISH"
 
+    # OTM check: CE is OTM when strike > spot; PE is OTM when strike < spot.
+    # Wall/writing logic is only meaningful for OTM strikes.
+    is_otm = True
+    if strike is not None and spot is not None:
+        is_otm = (opt_type == "CE" and strike > spot) or (opt_type == "PE" and strike < spot)
+
     # ---- premium RISING events ----
     if prem_pct > 0 and rupee_move >= MIN_RUPEE_MOVE:
         mult = prem_new / prem_old if prem_old else 0
         if oi_pct is not None and oi_pct <= -OI_FALL_PCT and aligned:
-            # premium up + OI down + move into strike = SHORT COVERING (strongest)
             return ("SHORT COVERING", bias,
                     f"prem {mult:.2f}x, OI {oi_pct:+.1f}% (writers exiting)")
         if mult >= BLAST_MULT and aligned:
-            # premium 1.6x+ with directional break = GAMMA BLAST
             return ("GAMMA BLAST", bias,
                     f"prem {mult:.2f}x in window, OI {oi_pct:+.1f}%")
-        # premium up + OI up = fresh buying (weaker; report only if strong multiplier)
         if mult >= BLAST_MULT and oi_pct is not None and oi_pct >= OI_RISE_PCT and aligned:
             return ("FRESH BUYING", bias,
                     f"prem {mult:.2f}x, OI {oi_pct:+.1f}% (new longs — weaker)")
 
-    # ---- premium FALLING events (structural, direction from opt side) ----
+    # ---- premium FALLING + OI RISING = fresh writing (wall) — OTM only ----
     if prem_pct is not None and prem_pct < 0 and oi_pct is not None:
-        if oi_pct >= OI_RISE_PCT:
-            # premium down + OI up = fresh WRITING = wall building on this strike
-            # CE writing = bearish pressure above; PE writing = bullish pressure below
+        if oi_pct >= OI_RISE_PCT and is_otm:
+            # CE writing (OTM, above spot) = bearish resistance
+            # PE writing (OTM, below spot) = bullish support
             wbias = "BEARISH" if opt_type == "CE" else "BULLISH"
             return ("WRITING PRESSURE", wbias,
-                    f"OI {oi_pct:+.1f}% building on {opt_type} (wall/resistance)")
+                    f"OI {oi_pct:+.1f}% building on OTM {opt_type} (wall)")
     return None
 
 
