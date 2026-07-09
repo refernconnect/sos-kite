@@ -69,14 +69,20 @@ def classify(prem_old, prem_new, oi_old, oi_new, spot_dir, opt_type, strike=None
             return ("FRESH BUYING", bias,
                     f"prem {mult:.2f}x, OI {oi_pct:+.1f}% (new longs — weaker)")
 
-    # ---- premium FALLING + OI RISING = fresh writing (wall) — OTM only ----
+    # ---- premium FALLING events ----
     if prem_pct is not None and prem_pct < 0 and oi_pct is not None:
         if oi_pct >= OI_RISE_PCT and is_otm:
-            # CE writing (OTM, above spot) = bearish resistance
-            # PE writing (OTM, below spot) = bullish support
+            # premium down + OI up = fresh WRITING (wall) — OTM only
             wbias = "BEARISH" if opt_type == "CE" else "BULLISH"
             return ("WRITING PRESSURE", wbias,
                     f"OI {oi_pct:+.1f}% building on OTM {opt_type} (wall)")
+        if oi_pct <= -OI_FALL_PCT:
+            # premium down + OI down = UNWINDING (holders exiting this side)
+            # CE unwinding = call longs giving up on upside -> BEARISH
+            # PE unwinding = put longs giving up on downside -> BULLISH
+            ubias = "BEARISH" if opt_type == "CE" else "BULLISH"
+            return ("UNWINDING", ubias,
+                    f"{opt_type} OI {oi_pct:+.1f}% + premium falling ({opt_type} longs exiting)")
     return None
 
 
@@ -108,27 +114,80 @@ def spot_broke_range(spot, day_high, day_low, ref_price):
 # GUIDANCE + RUNNING SITUATION
 # ─────────────────────────────────────────────────────────
 def event_guidance(event_type, bias, opt_type, strike, spot):
-    """One-line READ + WATCH per event. Context guidance, never an entry call."""
+    """Clear 'this is happening → do this' directive. Context events say WATCH a level;
+    release events say the trade. Never an entry call on a context event."""
+    up = bias == "BULLISH"
     if event_type == "WRITING PRESSURE":
         if opt_type == "CE":
-            return (f"READ: resistance ceiling building at {strike:.0f}.",
-                    f"WATCH: break ABOVE {strike:.0f} = bullish release. Holding below = capped.")
+            return (f"HAPPENING: sellers building a ceiling at {strike:.0f} (they expect price stays below).",
+                    f"DO: treat {strike:.0f} as resistance. Break ABOVE it = go long side. Below = stay out / fade.")
         else:
-            return (f"READ: support floor building at {strike:.0f}.",
-                    f"WATCH: break BELOW {strike:.0f} = bearish release. Holding above = supported.")
+            return (f"HAPPENING: sellers building a floor at {strike:.0f} (they expect price stays above).",
+                    f"DO: treat {strike:.0f} as support. Break BELOW it = go short side. Above = supported.")
     if event_type == "SHORT COVERING":
-        return (f"READ: {opt_type} writers trapped, covering — fuel for {'up' if opt_type=='CE' else 'down'}move.",
-                f"WATCH: continuation while covering persists. Fades when OI stops falling.")
+        d = "upside" if opt_type == "CE" else "downside"
+        s = "CE" if opt_type == "CE" else "PE"
+        return (f"HAPPENING: {s} sellers are trapped and buying back — real fuel for a {d} move ({bias}).",
+                f"DO: {'bullish' if up else 'bearish'} bias confirmed. Ride the {d} while OI keeps falling. Exit fast when OI stops dropping.")
+    if event_type == "UNWINDING":
+        s = "call" if opt_type == "CE" else "put"
+        d = "upside" if opt_type == "CE" else "downside"
+        opp = "downside" if opt_type == "CE" else "upside"
+        return (f"HAPPENING: {s} holders giving up on the {d} — {s} longs exiting ({bias}).",
+                f"DO: {'bullish' if up else 'bearish'} lean — the {opp} is now less defended. Confirm with spot direction before acting.")
     if event_type == "GAMMA BLAST":
-        return (f"READ: coil released, premium accelerating {bias.lower()}.",
-                f"WATCH: ride toward next strike; take fast — gamma round-trips hard.")
+        d = "up" if up else "down"
+        return (f"HAPPENING: the coil released — premium exploding {bias.lower()}.",
+                f"DO: this is the move. {d.upper()} side. Take the measured target FAST — gamma round-trips hard, no runners.")
     if event_type == "PREMIUM SURGE":
-        return (f"READ: {opt_type} premium accelerating but not full expiry-coil blast.",
-                f"WATCH: confirm with spot break before trusting.")
+        return (f"HAPPENING: {opt_type} premium accelerating, but not the full expiry-coil blast.",
+                f"DO: wait for spot to break the range before trusting it. Not a trade alone.")
     if event_type == "FRESH BUYING":
-        return (f"READ: new {opt_type} longs (weaker — could be trapped).",
-                f"WATCH: needs OI to keep rising + spot follow-through.")
+        return (f"HAPPENING: new {opt_type} longs entering (weaker — could be trapped buyers).",
+                f"DO: hold off. Needs OI to keep rising AND spot to follow. Weakest of the signals.")
     return ("", "")
+
+
+def trade_plan(event_type, bias, opt_type, strike, spot, struct, step, spot_hint=0):
+    """
+    Blast/covering -> resting-order PREMIUM levels (exchange executes at machine speed,
+    since gamma finishes in seconds). Context events -> level to watch.
+    spot_hint = current option LTP (premium) for resting-order math.
+    """
+    ce_wall = struct.get("ce_wall")
+    pe_wall = struct.get("pe_wall")
+    up = bias == "BULLISH"
+
+    if event_type in ("GAMMA BLAST", "SHORT COVERING"):
+        # Gamma moves finish in seconds — no message can manage them.
+        # Give resting-order PREMIUM levels to place at entry; exchange executes at machine speed.
+        entry_prem = spot_hint  # actually the option LTP, passed as spot_hint here
+        t1 = round(entry_prem * 1.55, 1)   # +55% -> book half
+        t2 = round(entry_prem * 2.00, 1)   # +100% -> book rest (2x is the classic blast target)
+        stop = round(entry_prem * 0.75, 1) # -25% -> cut
+        return (f"BUY {strike:.0f} {opt_type} @ ~{entry_prem:.1f}\n"
+                f"⏱ PLACE THESE RESTING ORDERS *NOW* AT ENTRY — don't watch, let them fire:\n"
+                f"• SELL limit {t1} (+55%) → books half\n"
+                f"• SELL limit {t2} (+100%, 2x) → books rest\n"
+                f"• STOP {stop} (−25%) → cuts loss\n"
+                f"Gamma finishes in seconds — resting orders beat any alert. Set & step back.\n"
+                f"ADD only on a pullback to entry that HOLDS — never into the run.")
+
+    if event_type == "WRITING PRESSURE":
+        if opt_type == "CE":
+            return (f"NO TRADE YET — {strike:.0f} is resistance.\n"
+                    f"• IF spot breaks ABOVE {strike:.0f} → THEN buy CE (plan on the break)\n"
+                    f"• Below = capped, stay out")
+        else:
+            return (f"NO TRADE YET — {strike:.0f} is support.\n"
+                    f"• IF spot breaks BELOW {strike:.0f} → THEN buy PE (plan on the break)\n"
+                    f"• Above = supported, stay out")
+    if event_type == "UNWINDING":
+        return (f"NO TRADE YET — {bias.lower()} lean only.\n"
+                f"• Wait for spot to confirm before any entry")
+    if event_type in ("FRESH BUYING", "PREMIUM SURGE"):
+        return "NO TRADE — weak/unconfirmed. Wait for a stronger signal."
+    return ""
 
 
 def build_situation(struct, spot, day_range, compressed, rng_pct):
