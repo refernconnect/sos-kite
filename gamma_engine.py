@@ -102,3 +102,66 @@ def spot_broke_range(spot, day_high, day_low, ref_price):
     if dn:
         return -1
     return 0
+
+
+# ─────────────────────────────────────────────────────────
+# GUIDANCE + RUNNING SITUATION
+# ─────────────────────────────────────────────────────────
+def event_guidance(event_type, bias, opt_type, strike, spot):
+    """One-line READ + WATCH per event. Context guidance, never an entry call."""
+    if event_type == "WRITING PRESSURE":
+        if opt_type == "CE":
+            return (f"READ: resistance ceiling building at {strike:.0f}.",
+                    f"WATCH: break ABOVE {strike:.0f} = bullish release. Holding below = capped.")
+        else:
+            return (f"READ: support floor building at {strike:.0f}.",
+                    f"WATCH: break BELOW {strike:.0f} = bearish release. Holding above = supported.")
+    if event_type == "SHORT COVERING":
+        return (f"READ: {opt_type} writers trapped, covering — fuel for {'up' if opt_type=='CE' else 'down'}move.",
+                f"WATCH: continuation while covering persists. Fades when OI stops falling.")
+    if event_type == "GAMMA BLAST":
+        return (f"READ: coil released, premium accelerating {bias.lower()}.",
+                f"WATCH: ride toward next strike; take fast — gamma round-trips hard.")
+    if event_type == "PREMIUM SURGE":
+        return (f"READ: {opt_type} premium accelerating but not full expiry-coil blast.",
+                f"WATCH: confirm with spot break before trusting.")
+    if event_type == "FRESH BUYING":
+        return (f"READ: new {opt_type} longs (weaker — could be trapped).",
+                f"WATCH: needs OI to keep rising + spot follow-through.")
+    return ("", "")
+
+
+def build_situation(struct, spot, day_range, compressed, rng_pct):
+    """Running summary of the accumulated structure for this index."""
+    ce_wall = struct.get("ce_wall")
+    pe_wall = struct.get("pe_wall")
+    lines = ["── SITUATION ──"]
+
+    if ce_wall and pe_wall:
+        band = ce_wall - pe_wall
+        lines.append(f"Coil {pe_wall:.0f} — {ce_wall:.0f} ({band:.0f}pt band), spot {spot:.0f}")
+    elif ce_wall:
+        lines.append(f"Resistance {ce_wall:.0f}, spot {spot:.0f} (no floor mapped yet)")
+    elif pe_wall:
+        lines.append(f"Support {pe_wall:.0f}, spot {spot:.0f} (no ceiling mapped yet)")
+    else:
+        lines.append(f"Spot {spot:.0f} — walls still forming")
+
+    # position within coil
+    if ce_wall and pe_wall and ce_wall > pe_wall:
+        pos = (spot - pe_wall) / (ce_wall - pe_wall) * 100
+        if pos > 70:
+            lines.append(f"Spot near ceiling ({pos:.0f}% up the band) — watch {ce_wall:.0f} break for upside.")
+        elif pos < 30:
+            lines.append(f"Spot near floor ({pos:.0f}% up the band) — watch {pe_wall:.0f} break for downside.")
+        else:
+            lines.append(f"Spot mid-band ({pos:.0f}%) — pinned; wait for edge break.")
+
+    lines.append(f"Morning range {rng_pct}% {'(compressed — coil intact)' if compressed else '(range expanded)'}")
+
+    # net read
+    if compressed and ce_wall and pe_wall:
+        lines.append("NET: expiry coil. Break of either wall = the trade. No entry mid-band.")
+    elif not compressed:
+        lines.append("NET: range already expanded — gamma-coil setup weaker today.")
+    return "\n".join(lines)
