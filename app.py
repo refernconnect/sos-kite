@@ -47,6 +47,7 @@ state = {
     "last_alert": {},    # (underlying, side) -> ts
     "gamma_log": [],     # recent events
     "day_range": {},     # idx_token -> {hi, lo} morning range
+    "structure": {},     # underlying -> {ce_wall, pe_wall, last_event, updated} running map
     "error": None,
 }
 lock = threading.Lock()
@@ -274,11 +275,29 @@ def gamma_loop():
 
             icon = {"GAMMA BLAST": "⚡", "SHORT COVERING": "🔥", "PREMIUM SURGE": "📈",
                     "WRITING PRESSURE": "🧱", "FRESH BUYING": "🟢"}.get(event_type, "•")
+
+            # update running structure map: walls from WRITING PRESSURE
+            with lock:
+                st = state["structure"].setdefault(meta["underlying"],
+                        {"ce_wall": None, "pe_wall": None, "last_event": None, "updated": None})
+                if event_type == "WRITING PRESSURE":
+                    if meta["type"] == "CE":
+                        st["ce_wall"] = meta["strike"]
+                    else:
+                        st["pe_wall"] = meta["strike"]
+                st["last_event"] = event_type
+                st["updated"] = now_ist.strftime("%H:%M")
+                struct_snapshot = dict(st)
+
+            read, watch = ge.event_guidance(event_type, bias, meta["type"], meta["strike"], spot_new)
+            situation = ge.build_situation(struct_snapshot, spot_new, dr, compressed, rng_pct)
+
             msg = (f"{icon} {event_type} — {bias}\n"
                    f"{meta['underlying']} {meta['type']} {meta['strike']:.0f} · {meta['symbol']}\n"
                    f"{detail}\n"
                    f"LTP {prem_new:.1f} (from {prem_old:.1f}) · spot {spot_new:.1f} · DTE {meta['dte']}\n"
-                   f"Morning range {rng_pct}% {'(compressed)' if compressed else ''} · confirm on OI dashboard.")
+                   f"\n→ {read}\n→ {watch}\n\n"
+                   f"{situation}")
             tg_send(msg)
             bridge_log(f"{event_type} {bias} {meta['underlying']} {meta['type']} {meta['strike']:.0f} :: {detail}")
             entry = {
