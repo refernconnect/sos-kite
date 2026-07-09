@@ -84,7 +84,7 @@ def tg_send(msg):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": msg},
+            json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"},
             timeout=8,
         )
     except Exception as e:
@@ -294,13 +294,14 @@ def gamma_loop():
             step = 100 if meta["underlying"] in ("BANKNIFTY", "SENSEX") else 50
             plan = ge.trade_plan(event_type, bias, meta["type"], meta["strike"], spot_new, struct_snapshot, step, spot_hint=prem_new)
 
-            msg = (f"{icon} {event_type} — {bias}\n"
+            biasdot = "🟢" if bias == "BULLISH" else "🔴"
+            msg = (f"{icon} <b>{event_type}</b> — {biasdot} <b>{bias}</b>\n"
                    f"{meta['underlying']} {meta['type']} {meta['strike']:.0f} · {meta['symbol']}\n"
                    f"{detail}\n"
                    f"LTP {prem_new:.1f} (from {prem_old:.1f}) · spot {spot_new:.1f} · DTE {meta['dte']}\n"
-                   f"\n▸ {read}\n▸ {watch}\n"
-                   f"\n{plan}\n"
-                   f"\n{situation}")
+                   f"\n▸ {read}\n▸ <b>{watch}</b>\n"
+                   f"\n<b>{plan}</b>\n"
+                   f"\n<i>{situation}</i>")
             tg_send(msg)
             bridge_log(f"{event_type} {bias} {meta['underlying']} {meta['type']} {meta['strike']:.0f} :: {detail}")
             entry = {
