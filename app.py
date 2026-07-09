@@ -252,7 +252,8 @@ def gamma_loop():
             gated = ge.in_gate(now_ist.time(), meta["dte"])
             broke = ge.spot_broke_range(spot_new, dr.get("hi", 0), dr.get("lo", 0), ref) if ref else 0
 
-            result = ge.classify(prem_old, prem_new, oi_old, oi_new, spot_dir, meta["type"])
+            result = ge.classify(prem_old, prem_new, oi_old, oi_new, spot_dir, meta["type"],
+                                  strike=meta["strike"], spot=spot_new)
             if not result:
                 continue
             event_type, bias, detail = result
