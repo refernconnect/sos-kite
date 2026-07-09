@@ -274,7 +274,7 @@ def gamma_loop():
                 state["last_alert"][key] = now_ts
 
             icon = {"GAMMA BLAST": "⚡", "SHORT COVERING": "🔥", "PREMIUM SURGE": "📈",
-                    "WRITING PRESSURE": "🧱", "FRESH BUYING": "🟢"}.get(event_type, "•")
+                    "WRITING PRESSURE": "🧱", "FRESH BUYING": "🟢", "UNWINDING": "🔄"}.get(event_type, "•")
 
             # update running structure map: walls from WRITING PRESSURE
             with lock:
@@ -291,13 +291,16 @@ def gamma_loop():
 
             read, watch = ge.event_guidance(event_type, bias, meta["type"], meta["strike"], spot_new)
             situation = ge.build_situation(struct_snapshot, spot_new, dr, compressed, rng_pct)
+            step = 100 if meta["underlying"] in ("BANKNIFTY", "SENSEX") else 50
+            plan = ge.trade_plan(event_type, bias, meta["type"], meta["strike"], spot_new, struct_snapshot, step, spot_hint=prem_new)
 
             msg = (f"{icon} {event_type} — {bias}\n"
                    f"{meta['underlying']} {meta['type']} {meta['strike']:.0f} · {meta['symbol']}\n"
                    f"{detail}\n"
                    f"LTP {prem_new:.1f} (from {prem_old:.1f}) · spot {spot_new:.1f} · DTE {meta['dte']}\n"
-                   f"\n→ {read}\n→ {watch}\n\n"
-                   f"{situation}")
+                   f"\n▸ {read}\n▸ {watch}\n"
+                   f"\n{plan}\n"
+                   f"\n{situation}")
             tg_send(msg)
             bridge_log(f"{event_type} {bias} {meta['underlying']} {meta['type']} {meta['strike']:.0f} :: {detail}")
             entry = {
