@@ -9,7 +9,7 @@ import json
 import time
 import threading
 from collections import deque
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dtime
 
 import requests
 from flask import Flask, request, redirect, jsonify, render_template_string
@@ -45,7 +45,8 @@ state = {
     "spot": {},          # index_token -> ltp
     "instruments": {},   # token -> {symbol, strike, type, underlying, expiry, dte}
     "last_alert": {},    # (underlying, side) -> ts
-    "gamma_log": [],     # recent ignitions
+    "gamma_log": [],     # recent events
+    "day_range": {},     # idx_token -> {hi, lo} morning range
     "error": None,
 }
 lock = threading.Lock()
@@ -153,17 +154,26 @@ def resolve_instruments():
 
 def on_ticks(ws, ticks):
     ts = time.time()
+    now_ist = datetime.now(IST)
     for t in ticks:
         tok = t["instrument_token"]
         price = t.get("last_price", 0)
         if not price:
             continue
+        oi = t.get("oi", 0)  # present in FULL mode for options
+
         if tok in (NIFTY_TOKEN, BANKNIFTY_TOKEN, SENSEX_TOKEN):
             with lock:
                 state["spot"][tok] = price
+                # track morning range (9:15 to 13:45) per index
+                dr = state["day_range"].setdefault(tok, {"hi": price, "lo": price})
+                if now_ist.time() <= dtime(13, 45):
+                    dr["hi"] = max(dr["hi"], price)
+                    dr["lo"] = min(dr["lo"], price)
+
         if tok not in hist:
             hist[tok] = deque(maxlen=600)
-        hist[tok].append((ts, price))
+        hist[tok].append((ts, price, oi))
 
 
 def on_connect(ws, response):
@@ -178,10 +188,10 @@ def on_connect(ws, response):
         toks = resolve_instruments()
         if toks:
             ws.subscribe(toks)
-            ws.set_mode(ws.MODE_LTP, toks)
+            ws.set_mode(ws.MODE_FULL, toks)  # FULL = includes OI, needed for squeeze/writing detection
             with lock:
                 state["subscribed"] = toks
-            tg_send(f"SOS KITE live — tracking {len(toks)} strikes (ATM±3, Nifty + BankNifty + Sensex)")
+            tg_send(f"SOS KITE live — tracking {len(toks)} strikes FULL mode (ATM±3, Nifty+BankNifty+Sensex)")
     threading.Thread(target=sub_options, daemon=True).start()
 
 
@@ -190,52 +200,70 @@ def on_close(ws, code, reason):
         state["ws_connected"] = False
 
 
-def window_pct(tok, now_ts):
-    """% change over WINDOW_SEC for a token."""
+def window_vals(tok, now_ts, window_sec):
+    """Return (old_price, new_price, old_oi, new_oi) over the window."""
     dq = hist.get(tok)
     if not dq or len(dq) < 2:
         return None
-    cutoff = now_ts - WINDOW_SEC
+    cutoff = now_ts - window_sec
     old = None
-    for ts, p in dq:
-        if ts >= cutoff:
-            old = p
+    for rec in dq:
+        if rec[0] >= cutoff:
+            old = rec
             break
-    if old is None or old <= 0:
+    if old is None:
         return None
-    cur = dq[-1][1]
-    return (cur - old) / old * 100
+    new = dq[-1]
+    return (old[1], new[1], old[2], new[2])
 
 
 def gamma_loop():
-    """Every EVAL_EVERY seconds, compute convexity per subscribed option."""
+    """Every EVAL_EVERY sec: classify each ATM-region strike for blast/covering/writing."""
+    import gamma_engine as ge
     while True:
         time.sleep(EVAL_EVERY)
         now_ts = time.time()
+        now_ist = datetime.now(IST)
         with lock:
             insts = dict(state["instruments"])
             subscribed = list(state["subscribed"])
+            spots = dict(state["spot"])
+            dayr = dict(state["day_range"])
 
         for tok in subscribed:
             meta = insts.get(tok)
             if not meta or meta["dte"] > MAX_DTE:
                 continue
-            opt_pct = window_pct(tok, now_ts)
-            spot_pct = window_pct(meta["idx_token"], now_ts)
-            if opt_pct is None or spot_pct is None:
-                continue
-            if abs(spot_pct) < MIN_SPOT_PCT or opt_pct <= 0:
-                continue
 
-            direction_ok = (meta["type"] == "CE" and spot_pct > 0) or (meta["type"] == "PE" and spot_pct < 0)
-            if not direction_ok:
+            wv = window_vals(tok, now_ts, WINDOW_SEC)
+            sv = window_vals(meta["idx_token"], now_ts, WINDOW_SEC)
+            if not wv or not sv:
                 continue
+            prem_old, prem_new, oi_old, oi_new = wv
+            spot_old, spot_new = sv[0], sv[1]
 
-            conv = abs(opt_pct / spot_pct)
-            if conv < CONV_MIN:
+            spot_dir = 1 if spot_new > spot_old else -1 if spot_new < spot_old else 0
+
+            # compression + gate context (for classic blast labelling)
+            idx = meta["idx_token"]
+            dr = dayr.get(idx, {})
+            ref = spots.get(idx)
+            compressed, rng_pct = ge.compression_state(dr.get("hi", 0), dr.get("lo", 0), ref) if ref else (False, 0)
+            gated = ge.in_gate(now_ist.time(), meta["dte"])
+            broke = ge.spot_broke_range(spot_new, dr.get("hi", 0), dr.get("lo", 0), ref) if ref else 0
+
+            result = ge.classify(prem_old, prem_new, oi_old, oi_new, spot_dir, meta["type"])
+            if not result:
                 continue
+            event_type, bias, detail = result
 
-            key = (meta["underlying"], meta["type"])
+            # For GAMMA BLAST specifically, require the coil+gate+release context
+            if event_type == "GAMMA BLAST":
+                if not (compressed and gated and broke != 0):
+                    # premium accelerating but not the classic expiry-coil blast -> downgrade label
+                    event_type = "PREMIUM SURGE"
+
+            key = (meta["underlying"], meta["type"], event_type)
             with lock:
                 last = state["last_alert"].get(key, 0)
             if now_ts - last < COOLDOWN_SEC:
@@ -243,21 +271,19 @@ def gamma_loop():
             with lock:
                 state["last_alert"][key] = now_ts
 
-            cur_price = hist[tok][-1][1]
-            msg = (f"⚡ GAMMA IGNITION [tick] — {meta['symbol']}\n"
-                   f"{meta['underlying']} {meta['type']} · strike {meta['strike']:.0f}\n"
-                   f"Premium {opt_pct:+.1f}% vs spot {spot_pct:+.2f}% in {WINDOW_SEC}s "
-                   f"→ convexity {conv:.1f}x\n"
-                   f"LTP {cur_price:.2f} · DTE {meta['dte']}\n"
-                   f"Confirm on OI dashboard before acting.")
+            icon = {"GAMMA BLAST": "⚡", "SHORT COVERING": "🔥", "PREMIUM SURGE": "📈",
+                    "WRITING PRESSURE": "🧱", "FRESH BUYING": "🟢"}.get(event_type, "•")
+            msg = (f"{icon} {event_type} — {bias}\n"
+                   f"{meta['underlying']} {meta['type']} {meta['strike']:.0f} · {meta['symbol']}\n"
+                   f"{detail}\n"
+                   f"LTP {prem_new:.1f} (from {prem_old:.1f}) · spot {spot_new:.1f} · DTE {meta['dte']}\n"
+                   f"Morning range {rng_pct}% {'(compressed)' if compressed else ''} · confirm on OI dashboard.")
             tg_send(msg)
-            bridge_log(f"GAMMA-TICK {meta['underlying']} {meta['type']} {meta['strike']:.0f} conv {conv:.1f}x")
+            bridge_log(f"{event_type} {bias} {meta['underlying']} {meta['type']} {meta['strike']:.0f} :: {detail}")
             entry = {
-                "time": datetime.now(IST).strftime("%H:%M:%S"),
-                "symbol": meta["symbol"],
-                "conv": round(conv, 1),
-                "opt_pct": round(opt_pct, 1),
-                "spot_pct": round(spot_pct, 2),
+                "time": now_ist.strftime("%H:%M:%S"),
+                "type": event_type, "bias": bias, "symbol": meta["symbol"],
+                "detail": detail, "ltp": round(prem_new, 1),
             }
             with lock:
                 state["gamma_log"].append(entry)
@@ -408,9 +434,9 @@ Strikes tracked: {{ s.n_subscribed }}<br>
 {% else %}
 <a class="btn" href="/kite/login" style="background:#3a3630;color:#C4A882;">RE-LOGIN (new day / stream stuck)</a>
 {% endif %}
-<h1 style="margin-top:14px">Ignitions today</h1>
+<h1 style="margin-top:14px">Events today</h1>
 {% for g in s.gamma_log %}
-<div class="card g">{{ g.time }} — {{ g.symbol }} · conv {{ g.conv }}x · premium {{ g.opt_pct }}% vs spot {{ g.spot_pct }}%</div>
+<div class="card g">{{ g.time }} — <b>{{ g.type }}</b> {{ g.bias }} · {{ g.symbol }} · {{ g.detail }} · LTP {{ g.ltp }}</div>
 {% endfor %}
 {% if not s.gamma_log %}<div class="card">None yet.</div>{% endif %}
 </body>
