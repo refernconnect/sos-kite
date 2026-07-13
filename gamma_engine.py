@@ -56,10 +56,19 @@ def classify(prem_old, prem_new, oi_old, oi_new, spot_dir, opt_type, strike=None
     if strike is not None and spot is not None:
         is_otm = (opt_type == "CE" and strike > spot) or (opt_type == "PE" and strike < spot)
 
+    # scaled rupee floor: expensive strikes need proportional moves (kills Rs8-on-Rs180 noise)
+    eff_floor = max(MIN_RUPEE_MOVE, 0.10 * prem_old) if prem_old else MIN_RUPEE_MOVE
+
     # ---- premium RISING events ----
-    if prem_pct > 0 and rupee_move >= MIN_RUPEE_MOVE:
+    if prem_pct > 0 and rupee_move >= eff_floor:
         mult = prem_new / prem_old if prem_old else 0
-        if oi_pct is not None and oi_pct <= -OI_FALL_PCT and aligned:
+        # SHORT COVERING requires: OI falling + aligned + real multiplier + ATM/OTM strike
+        near_or_otm = is_otm
+        if strike is not None and spot is not None and not is_otm:
+            # allow ATM-ish ITM (within one step ~ spot*0.15%) but reject deep ITM
+            near_or_otm = abs(strike - spot) <= spot * 0.0015
+        if (oi_pct is not None and oi_pct <= -OI_FALL_PCT and aligned
+                and mult >= 1.25 and near_or_otm):
             return ("SHORT COVERING", bias,
                     f"prem {mult:.2f}x, OI {oi_pct:+.1f}% (writers exiting)")
         if mult >= BLAST_MULT and aligned:
