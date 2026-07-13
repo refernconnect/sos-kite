@@ -14,6 +14,7 @@ from datetime import datetime, timezone, timedelta, time as dtime
 import requests
 from flask import Flask, request, redirect, jsonify, render_template_string
 from kiteconnect import KiteConnect, KiteTicker
+import positioning as pos
 
 app = Flask(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -30,7 +31,7 @@ WINDOW_SEC     = 60    # rolling comparison window
 EVAL_EVERY     = 5     # evaluate every N seconds
 CONV_MIN       = 3.0   # premium % move ≥ 3x spot % move
 MIN_SPOT_PCT   = 0.03  # ignore if spot moved < 0.03% in window
-MAX_DTE        = 2     # only flag within 2 days of expiry
+MAX_DTE        = 45    # classify events any DTE (blast itself gated to DTE0 inside logic)
 COOLDOWN_SEC   = 600   # one alert per side per instrument per 10 min
 
 TOKEN_FILE = "/tmp/kite_token.json"
@@ -48,6 +49,8 @@ state = {
     "gamma_log": [],     # recent events
     "day_range": {},     # idx_token -> {hi, lo} morning range
     "structure": {},     # underlying -> {ce_wall, pe_wall, last_event, updated} running map
+    "futures": {},       # underlying -> {token, open_price, open_oi, last_quad}
+    "brief_sent": None,  # date of last auto morning brief
     "error": None,
 }
 lock = threading.Lock()
@@ -150,6 +153,20 @@ def resolve_instruments():
                         "idx_token": idx_token,
                         "dte": dte,
                     }
+
+        # nearest-month FUTURES for the live positioning quadrant
+        futs = [i for i in source
+                if i["name"] == underlying and i["instrument_type"] == "FUT"
+                and i["expiry"] and i["expiry"] >= now]
+        if futs:
+            nearest_fut = min(futs, key=lambda x: x["expiry"])
+            ftok = nearest_fut["instrument_token"]
+            tokens.append(ftok)
+            with lock:
+                state["futures"][underlying] = {
+                    "token": ftok, "symbol": nearest_fut["tradingsymbol"],
+                    "open_price": None, "open_oi": None, "last_quad": None,
+                }
     return tokens
 
 
@@ -171,6 +188,18 @@ def on_ticks(ws, ticks):
                 if now_ist.time() <= dtime(13, 45):
                     dr["hi"] = max(dr["hi"], price)
                     dr["lo"] = min(dr["lo"], price)
+
+        # futures open snapshot (first tick of day) for since-open quadrant
+        with lock:
+            for u, f in state["futures"].items():
+                if f["token"] == tok:
+                    if f["open_price"] is None and price:
+                        f["open_price"] = price
+                    if f["open_oi"] is None and oi:
+                        f["open_oi"] = oi
+                    f["last_price"] = price
+                    f["last_oi"] = oi
+                    break
 
         if tok not in hist:
             hist[tok] = deque(maxlen=600)
@@ -467,6 +496,91 @@ Strikes tracked: {{ s.n_subscribed }}<br>
 </html>
 """
 
+
+
+def build_full_brief():
+    """Daily futures OI quadrant brief (the desks' view) for all three underlyings."""
+    if not state.get("access_token"):
+        return None, "not logged in"
+    blocks = []
+    to_d = datetime.now(IST)
+    from_d = to_d - timedelta(days=12)
+    with lock:
+        futs = dict(state["futures"])
+    if not futs:
+        return None, "futures not resolved yet (login + wait for ticker)"
+    for underlying, f in futs.items():
+        try:
+            data = kite.historical_data(
+                f["token"],
+                from_d.strftime("%Y-%m-%d"),
+                to_d.strftime("%Y-%m-%d"),
+                "day", oi=True,
+            )
+            candles = [{"date": d["date"], "close": d["close"], "oi": d.get("oi", 0)} for d in data]
+            blocks.append(pos.daily_brief(candles, underlying))
+        except Exception as e:
+            blocks.append(f"— {underlying} — brief failed: {e}")
+
+        # live since-open line
+        q = pos.intraday_quadrant(f.get("open_price"), f.get("last_price"),
+                                  f.get("open_oi"), f.get("last_oi")) if f.get("last_price") else None
+        if q:
+            label, bias, dot, p, o = q
+            blocks.append(f"  today live: {dot} {label} (px {p:+.2f}% · OI {o:+.2f}%)")
+    txt = "📋 POSITIONING BRIEF — " + datetime.now(IST).strftime("%d %b %H:%M") + "\n\n" + "\n\n".join(blocks)
+    return txt, None
+
+
+@app.route("/brief")
+def brief_route():
+    txt, err = build_full_brief()
+    if err:
+        return jsonify({"error": err}), 400
+    return "<pre style='background:#1A1816;color:#e8e2d8;padding:14px;font-size:13px'>" + txt + "</pre>"
+
+
+def positioning_loop():
+    """Morning auto-brief (~09:05) + live quadrant flip alerts (30-min cooldown)."""
+    while True:
+        time.sleep(60)
+        now = datetime.now(IST)
+        try:
+            # morning brief once per day after 09:05, if logged in
+            if now.time() >= dtime(9, 5) and now.time() <= dtime(15, 30):
+                with lock:
+                    sent = state.get("brief_sent")
+                today = now.strftime("%Y-%m-%d")
+                if sent != today and state.get("access_token"):
+                    txt, err = build_full_brief()
+                    if txt:
+                        tg_send(txt)
+                        with lock:
+                            state["brief_sent"] = today
+
+            # live quadrant flip detection
+            with lock:
+                futs = dict(state["futures"])
+            for underlying, f in futs.items():
+                if not f.get("last_price") or not f.get("open_price"):
+                    continue
+                q = pos.intraday_quadrant(f["open_price"], f["last_price"], f["open_oi"], f["last_oi"])
+                if not q:
+                    continue
+                label, bias, dot, p, o = q
+                if label in ("FLAT",):
+                    continue
+                if f.get("last_quad") != label:
+                    with lock:
+                        state["futures"][underlying]["last_quad"] = label
+                    if f.get("last_quad") is not None:  # skip the first classification of the day
+                        tg_send(f"{dot} FUTURES QUADRANT FLIP — {underlying}\n"
+                                f"Now: {label} ({bias})\n"
+                                f"Since open: px {p:+.2f}% · OI {o:+.2f}%\n"
+                                f"▸ The positional view just changed — reassess open bias.")
+        except Exception as e:
+            print(f"positioning loop error: {e}")
+
 # ─── STARTUP ───
 def boot():
     tok = load_token()
@@ -482,6 +596,7 @@ def boot():
 
 boot()
 threading.Thread(target=gamma_loop, daemon=True).start()
+threading.Thread(target=positioning_loop, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
