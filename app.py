@@ -414,10 +414,6 @@ def kite_callback():
 def health():
     return "ok"
     
-@app.route("/peek-token-9fzy")
-def peek_token():
-    with lock:
-        return jsonify({"token": state.get("access_token")})
 
 @app.route("/backtest")
 def backtest_route():
