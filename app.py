@@ -413,6 +413,15 @@ def kite_callback():
 @app.route("/health")
 def health():
     return "ok"
+
+TOKEN_SECRET = os.environ.get("TOKEN_SHARE_SECRET", "")
+
+@app.route("/token")
+def token_route():
+    if not TOKEN_SECRET or request.args.get("secret") != TOKEN_SECRET:
+        return "forbidden", 403
+    with lock:
+        return jsonify({"token": state.get("access_token")})
     
 
 @app.route("/backtest")
