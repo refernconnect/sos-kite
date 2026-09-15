@@ -875,9 +875,6 @@ boot()
 threading.Thread(target=gamma_loop, daemon=True).start()
 threading.Thread(target=positioning_loop, daemon=True).start()
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5002))
-    app.run(host="0.0.0.0", port=port, threaded=True)
 
 @app.route("/cas_edge")
 def cas_edge_route():
@@ -976,3 +973,8 @@ def cas_edge_route():
         [r for r in sel5 if r["side"] == -1])
     out["worst_10_trades"] = sorted(sel5, key=lambda r: r["capture_bps"])[:10]
     return jsonify(out)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5002))
+    app.run(host="0.0.0.0", port=port, threaded=True)
