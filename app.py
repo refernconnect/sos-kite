@@ -878,3 +878,101 @@ threading.Thread(target=positioning_loop, daemon=True).start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
+
+@app.route("/cas_edge")
+def cas_edge_route():
+    """Is the CAS fade actually tradeable? Expectancy per trade, net of cost.
+
+    Query: ?limit=15&start=2026-07-01&cost_bps=20&regime=post
+      regime: post = CAS sessions only, pre = pre-CAS control, all = both
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+
+    limit = int(request.args.get("limit", 15))
+    start = request.args.get("start", CAS_START_DATE)
+    cost_bps = float(request.args.get("cost_bps", 20))
+    regime = request.args.get("regime", "post")
+    want_bar = {"post": "15:14", "pre": "15:29"}.get(regime)
+
+    to_d = datetime.now(IST)
+    from_d = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=IST)
+
+    try:
+        nse = kite.instruments("NSE")
+    except Exception as e:
+        return jsonify({"error": "instruments() failed: %s" % e}), 500
+    tokmap = {r["tradingsymbol"]: r["instrument_token"] for r in nse
+              if r.get("segment") == "NSE" and r.get("instrument_type") == "EQ"}
+
+    rows = []
+    for sym in NIFTY50_SYMBOLS[:limit]:
+        tok = tokmap.get(sym)
+        if not tok:
+            continue
+        try:
+            a = from_d.strftime("%Y-%m-%d %H:%M:%S")
+            b = to_d.strftime("%Y-%m-%d %H:%M:%S")
+            mins = kite.historical_data(tok, a, b, "minute")
+            days = kite.historical_data(tok, a, b, "day")
+        except Exception:
+            time.sleep(0.4)
+            continue
+        for dk, s in _cas_day_stats(mins, days).items():
+            if not s["next_open"] or not s["ref_vwap"]:
+                continue
+            if want_bar and s["last_minute_bar"] != want_bar:
+                continue
+            delta = (s["close"] - s["ref_vwap"]) / s["ref_vwap"] * 100.0
+            nxt = (s["next_open"] - s["close"]) / s["close"] * 100.0
+            side = 1 if delta > 0 else -1          # +1 = close printed high -> fade short
+            capture = -side * nxt * 100.0          # bps earned by fading
+            rows.append({"symbol": sym, "date": dk, "delta_pct": round(delta, 3),
+                         "next_open_pct": round(nxt, 3), "side": side,
+                         "capture_bps": round(capture, 1)})
+        time.sleep(0.4)
+
+    if not rows:
+        return jsonify({"error": "no rows", "regime": regime}), 500
+
+    def stats(sel):
+        if not sel:
+            return None
+        caps = sorted(r["capture_bps"] for r in sel)
+        n = len(caps)
+        mean = sum(caps) / n
+        med = caps[n // 2] if n % 2 else (caps[n // 2 - 1] + caps[n // 2]) / 2.0
+        wins = sum(1 for c in caps if c > 0)
+        sd = (sum((c - mean) ** 2 for c in caps) / n) ** 0.5
+        net = mean - cost_bps
+        return {
+            "trades": n,
+            "win_rate_pct": round(wins / n * 100, 1),
+            "mean_capture_bps": round(mean, 1),
+            "median_capture_bps": round(med, 1),
+            "stdev_bps": round(sd, 1),
+            "net_expectancy_bps": round(net, 1),
+            "total_net_bps": round(net * n, 0),
+            "best_bps": caps[-1],
+            "worst_bps": caps[0],
+        }
+
+    out = {
+        "regime": regime,
+        "cost_bps_assumed": cost_bps,
+        "sessions": len(set(r["date"] for r in rows)),
+        "symbols": len(set(r["symbol"] for r in rows)),
+        "all_stock_days": stats(rows),
+        "by_threshold": {},
+        "by_direction_at_0.5": {},
+    }
+    for th in (0.3, 0.5, 0.75, 1.0):
+        out["by_threshold"]["abs_delta_gte_%.2f_pct" % th] = stats(
+            [r for r in rows if abs(r["delta_pct"]) >= th])
+    sel5 = [r for r in rows if abs(r["delta_pct"]) >= 0.5]
+    out["by_direction_at_0.5"]["close_printed_HIGH_fade_short"] = stats(
+        [r for r in sel5 if r["side"] == 1])
+    out["by_direction_at_0.5"]["close_printed_LOW_fade_long"] = stats(
+        [r for r in sel5 if r["side"] == -1])
+    out["worst_10_trades"] = sorted(sel5, key=lambda r: r["capture_bps"])[:10]
+    return jsonify(out)
