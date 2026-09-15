@@ -974,7 +974,112 @@ def cas_edge_route():
     out["worst_10_trades"] = sorted(sel5, key=lambda r: r["capture_bps"])[:10]
     return jsonify(out)
 
+@app.route("/cas_rank")
+def cas_rank_route():
+    """Per-symbol CAS dislocation stats, for picking a shortlist.
 
+    Query: ?offset=0&limit=12&start=2026-08-03&th=0.75&cost_bps=10
+    Chunk with offset to stay under the request timeout.
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+
+    offset = int(request.args.get("offset", 0))
+    limit = int(request.args.get("limit", 12))
+    start = request.args.get("start", CAS_START_DATE)
+    th = float(request.args.get("th", 0.75))
+    cost_bps = float(request.args.get("cost_bps", 10))
+
+    # universe: CAS-eligible symbols from NSE, ordered by traded value
+    universe, uni_src = [], "nse"
+    try:
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate",
+        })
+        s.get("https://www.nseindia.com", timeout=12)
+        s.get("https://www.nseindia.com/market-data/closing-auction-session", timeout=12)
+        r = s.get("https://www.nseindia.com/api/NextApi/apiClient/casApi"
+                  "?functionName=getCASData",
+                  headers={"Referer": "https://www.nseindia.com/market-data/"
+                                      "closing-auction-session",
+                           "X-Requested-With": "XMLHttpRequest"}, timeout=15)
+        data = r.json().get("data") or []
+        data.sort(key=lambda d: d.get("finalValue") or 0, reverse=True)
+        universe = [d["symbol"] for d in data if d.get("symbol")]
+    except Exception as e:
+        uni_src = "fallback:%s" % str(e)[:60]
+    if not universe:
+        universe = NIFTY50_SYMBOLS
+        uni_src = "fallback_nifty50"
+
+    chunk = universe[offset:offset + limit]
+
+    try:
+        nse = kite.instruments("NSE")
+    except Exception as e:
+        return jsonify({"error": "instruments() failed: %s" % e}), 500
+    tokmap = {r2["tradingsymbol"]: r2["instrument_token"] for r2 in nse
+              if r2.get("segment") == "NSE" and r2.get("instrument_type") == "EQ"}
+
+    to_d = datetime.now(IST)
+    from_d = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=IST)
+    a = from_d.strftime("%Y-%m-%d %H:%M:%S")
+    b = to_d.strftime("%Y-%m-%d %H:%M:%S")
+
+    out = []
+    for sym in chunk:
+        tok = tokmap.get(sym)
+        if not tok:
+            out.append({"symbol": sym, "error": "no token"})
+            continue
+        try:
+            mins = kite.historical_data(tok, a, b, "minute")
+            days = kite.historical_data(tok, a, b, "day")
+        except Exception as e:
+            out.append({"symbol": sym, "error": str(e)[:60]})
+            time.sleep(0.4)
+            continue
+
+        caps, n_days, hits = [], 0, 0
+        for dk, st in _cas_day_stats(mins, days).items():
+            if not st["next_open"] or not st["ref_vwap"]:
+                continue
+            if st["last_minute_bar"] != "15:14":
+                continue
+            n_days += 1
+            delta = (st["close"] - st["ref_vwap"]) / st["ref_vwap"] * 100.0
+            if abs(delta) < th:
+                continue
+            hits += 1
+            side = 1 if delta > 0 else -1
+            nxt = (st["next_open"] - st["close"]) / st["close"] * 100.0
+            caps.append(-side * nxt * 100.0)
+        time.sleep(0.4)
+
+        row = {"symbol": sym, "sessions": n_days, "hits": hits,
+               "hit_rate_pct": round(hits / n_days * 100, 1) if n_days else None}
+        if caps:
+            caps.sort()
+            m = sum(caps) / len(caps)
+            row.update({
+                "win_rate_pct": round(sum(1 for c in caps if c > 0) / len(caps) * 100, 1),
+                "mean_bps": round(m, 1),
+                "median_bps": round(caps[len(caps) // 2], 1),
+                "net_bps": round(m - cost_bps, 1),
+                "total_net_bps": round((m - cost_bps) * len(caps), 0),
+                "worst_bps": caps[0],
+            })
+        out.append(row)
+
+    return jsonify({"universe_source": uni_src, "universe_size": len(universe),
+                    "offset": offset, "limit": limit, "threshold_pct": th,
+                    "cost_bps": cost_bps, "symbols": out})
+    
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
