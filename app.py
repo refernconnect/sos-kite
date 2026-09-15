@@ -1305,6 +1305,187 @@ def ob_backtest_route():
         "sample": filled[-15:],
     })
 
+def _atr(bars, n=14):
+    out, prev_c, rma = [], None, None
+    for b in bars:
+        if prev_c is None:
+            tr = b["high"] - b["low"]
+        else:
+            tr = max(b["high"] - b["low"], abs(b["high"] - prev_c),
+                     abs(b["low"] - prev_c))
+        rma = tr if rma is None else (rma * (n - 1) + tr) / n
+        out.append(rma)
+        prev_c = b["close"]
+    return out
+
+
+@app.route("/ob2")
+def ob2_route():
+    """Opening-bias backtest v2. Defaults reproduce the original rules.
+
+    Switches: ?ignore_c1=1  ?stop_mode=atr  ?arm_trail=1
+    Params:   days tol stop_pts off1 off2 atr_len atr_mult min_stop max_stop
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+
+    g = request.args.get
+    days = int(g("days", 120)); tol = float(g("tol", 2.0))
+    ignore_c1 = g("ignore_c1") == "1"
+    arm_trail = g("arm_trail") == "1"
+    stop_mode = g("stop_mode", "fixed")
+    stop_fixed = float(g("stop_pts", 30.0))
+    atr_len = int(g("atr_len", 14)); atr_mult = float(g("atr_mult", 1.5))
+    min_stop = float(g("min_stop", 10.0)); max_stop = float(g("max_stop", 60.0))
+    off1 = float(g("off1", 14.0)); off2 = float(g("off2", 10.0))
+
+    c5 = _by_day(_pull(NIFTY_TOKEN, days, "5minute"))
+    c3 = _by_day(_pull(NIFTY_TOKEN, days, "3minute"))
+    if not c5:
+        return jsonify({"error": "no 5m candles"}), 500
+
+    trades, nbias, stops = [], 0, []
+
+    for dk in sorted(c5.keys()):
+        bars = c5[dk]
+        if len(bars) < 12 or dk not in c3:
+            continue
+        op, h1, l1 = bars[0]["open"], bars[0]["high"], bars[0]["low"]
+
+        bias2, brk_i = None, None
+        for i in range(1, min(len(bars) - 1, 24)):
+            b = bars[i]
+            if b["high"] > h1:
+                nx = bars[i + 1]
+                bias2 = "bull" if nx["close"] > nx["open"] else None
+                brk_i = i + 1; break
+            if b["low"] < l1:
+                nx = bars[i + 1]
+                bias2 = "bear" if nx["close"] < nx["open"] else None
+                brk_i = i + 1; break
+        if not bias2:
+            continue
+
+        if ignore_c1:
+            bias = bias2
+        else:
+            lo = min(b["low"] for b in bars[:brk_i + 1])
+            hi = max(b["high"] for b in bars[:brk_i + 1])
+            bias1 = "bull" if lo >= op - tol else ("bear" if hi <= op + tol else None)
+            if bias1 != bias2:
+                continue
+            bias = bias1
+        nbias += 1
+
+        cl = [b["close"] for b in bars]
+        e7, e17 = _ema(cl, 7), _ema(cl, 17)
+        ml, ms = _macd(cl)
+        a5 = _atr(bars, atr_len)
+
+        def crossed(i):
+            if i < 1:
+                return False
+            if bias == "bull":
+                return ((e7[i-1] <= e17[i-1] and e7[i] > e17[i]) or
+                        (ml[i-1] <= ms[i-1] and ml[i] > ms[i]))
+            return ((e7[i-1] >= e17[i-1] and e7[i] < e17[i]) or
+                    (ml[i-1] >= ms[i-1] and ml[i] < ms[i]))
+
+        sig = []
+        for i in range(brk_i + 1, len(bars)):
+            if crossed(i):
+                sig.append(i)
+            if len(sig) == 2:
+                break
+
+        b3 = c3[dk]
+        c3c = [x["close"] for x in b3]
+        E7, E17 = _ema(c3c, 7), _ema(c3c, 17)
+
+        for n, si in enumerate(sig):
+            off = off1 if n == 0 else off2
+            ref = bars[si]["close"]
+            want = ref - off if bias == "bull" else ref + off
+            t0 = bars[si]["date"]; t1 = t0 + timedelta(minutes=30)
+
+            sp = (max(min_stop, min(max_stop, atr_mult * a5[si]))
+                  if stop_mode == "atr" else stop_fixed)
+            stops.append(round(sp, 1))
+
+            ft = fp = None
+            for b in bars:
+                if b["date"] <= t0 or b["date"] > t1:
+                    continue
+                if bias == "bull" and b["low"] <= want:
+                    ft, fp = b["date"], want; break
+                if bias == "bear" and b["high"] >= want:
+                    ft, fp = b["date"], want; break
+            if not ft:
+                trades.append({"date": dk, "leg": n+1, "bias": bias,
+                               "filled": False, "pts": 0.0, "exit_why": "unfilled"})
+                continue
+
+            armed = not arm_trail
+            xp = xw = None
+            for j, b in enumerate(b3):
+                if b["date"] <= ft:
+                    continue
+                mv = (b["low"] - fp) if bias == "bull" else (fp - b["high"])
+                if mv <= -sp:
+                    xp = fp - sp if bias == "bull" else fp + sp
+                    xw = "stop"; break
+                above = b["close"] > E7[j] if bias == "bull" else b["close"] < E7[j]
+                if not armed:
+                    if above:
+                        armed = True
+                    continue
+                if bias == "bull":
+                    if b["close"] < E17[j]:
+                        xp, xw = b["close"], "ema17"; break
+                    if b["close"] < E7[j]:
+                        xp, xw = b["close"], "ema7"; break
+                else:
+                    if b["close"] > E17[j]:
+                        xp, xw = b["close"], "ema17"; break
+                    if b["close"] > E7[j]:
+                        xp, xw = b["close"], "ema7"; break
+            if xp is None:
+                xp, xw = b3[-1]["close"], "eod"
+
+            pts = (xp - fp) if bias == "bull" else (fp - xp)
+            trades.append({"date": dk, "leg": n+1, "bias": bias, "filled": True,
+                           "entry": round(fp, 2), "exit": round(xp, 2),
+                           "stop_pts": round(sp, 1), "pts": round(pts, 2),
+                           "exit_why": xw})
+
+    fl = [t for t in trades if t["filled"]]
+    if not fl:
+        return jsonify({"sessions": len(c5), "days_with_bias": nbias,
+                        "signals": len(trades), "filled": 0}), 200
+    p = sorted(t["pts"] for t in fl)
+    n = len(p)
+    w = [x for x in p if x > 0]; l = [x for x in p if x <= 0]
+    why = {}
+    for t in fl:
+        why[t["exit_why"]] = why.get(t["exit_why"], 0) + 1
+    bl = sum(1 for t in fl if t["bias"] == "bull")
+    su = sorted(stops)
+    return jsonify({
+        "sessions": len(c5), "days_with_bias": nbias,
+        "signals": len(trades), "filled": n, "unfilled": len(trades) - n,
+        "long_trades": bl, "short_trades": n - bl,
+        "win_rate_pct": round(len(w) / n * 100, 1),
+        "mean_pts": round(sum(p) / n, 2), "median_pts": round(p[n // 2], 2),
+        "total_pts": round(sum(p), 1),
+        "avg_win_pts": round(sum(w) / len(w), 2) if w else None,
+        "avg_loss_pts": round(sum(l) / len(l), 2) if l else None,
+        "best_pts": p[-1], "worst_pts": p[0],
+        "exit_reasons": why,
+        "stop_median": su[len(su) // 2] if su else None,
+        "switches": {"ignore_c1": ignore_c1, "arm_trail": arm_trail,
+                     "stop_mode": stop_mode},
+        "sample": fl[-10:],
+    })
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
