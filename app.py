@@ -1486,6 +1486,170 @@ def ob2_route():
                      "stop_mode": stop_mode},
         "sample": fl[-10:],
     })
+@app.route("/ob3")
+def ob3_route():
+    """ORB + opening-participation filter, bucketed. Defaults = best config.
+
+    ?days=120 &trail_tf=3|5 &stop_pts=30 &off1=14 &off2=10
+    &ignore_c1=1 &arm_trail=1 &minrvr=0
+    rvr = first 5m range / mean of prior 20 sessions' first 5m range
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+
+    g = request.args.get
+    days = int(g("days", 120))
+    ignore_c1 = g("ignore_c1", "1") == "1"
+    arm_trail = g("arm_trail", "1") == "1"
+    trail_tf = g("trail_tf", "3")
+    stop_pts = float(g("stop_pts", 30.0))
+    off1 = float(g("off1", 14.0)); off2 = float(g("off2", 10.0))
+    tol = float(g("tol", 2.0)); minrvr = float(g("minrvr", 0.0))
+
+    c5 = _by_day(_pull(NIFTY_TOKEN, days, "5minute"))
+    c3 = _by_day(_pull(NIFTY_TOKEN, days, "3minute"))
+    if not c5:
+        return jsonify({"error": "no 5m candles"}), 500
+
+    dks = sorted(c5.keys())
+    rng = {d: (c5[d][0]["high"] - c5[d][0]["low"]) for d in dks if c5[d]}
+    rvr = {}
+    for i, d in enumerate(dks):
+        prev = [rng[x] for x in dks[max(0, i - 20):i] if x in rng]
+        rvr[d] = (rng[d] / (sum(prev) / len(prev))) if prev and sum(prev) else None
+
+    trades = []
+    for dk in dks:
+        bars = c5[dk]
+        if len(bars) < 12 or dk not in c3 or rvr.get(dk) is None:
+            continue
+        r = rvr[dk]
+        if r < minrvr:
+            continue
+        op, h1, l1 = bars[0]["open"], bars[0]["high"], bars[0]["low"]
+
+        bias2 = brk_i = None
+        for i in range(1, min(len(bars) - 1, 24)):
+            b = bars[i]
+            if b["high"] > h1:
+                nx = bars[i + 1]
+                bias2 = "bull" if nx["close"] > nx["open"] else None
+                brk_i = i + 1; break
+            if b["low"] < l1:
+                nx = bars[i + 1]
+                bias2 = "bear" if nx["close"] < nx["open"] else None
+                brk_i = i + 1; break
+        if not bias2:
+            continue
+        if ignore_c1:
+            bias = bias2
+        else:
+            lo = min(b["low"] for b in bars[:brk_i + 1])
+            hi = max(b["high"] for b in bars[:brk_i + 1])
+            b1 = "bull" if lo >= op - tol else ("bear" if hi <= op + tol else None)
+            if b1 != bias2:
+                continue
+            bias = b1
+
+        cl = [b["close"] for b in bars]
+        e7, e17 = _ema(cl, 7), _ema(cl, 17)
+        ml, ms = _macd(cl)
+
+        def crossed(i):
+            if i < 1:
+                return False
+            if bias == "bull":
+                return ((e7[i-1] <= e17[i-1] and e7[i] > e17[i]) or
+                        (ml[i-1] <= ms[i-1] and ml[i] > ms[i]))
+            return ((e7[i-1] >= e17[i-1] and e7[i] < e17[i]) or
+                    (ml[i-1] >= ms[i-1] and ml[i] < ms[i]))
+
+        sig = []
+        for i in range(brk_i + 1, len(bars)):
+            if crossed(i):
+                sig.append(i)
+            if len(sig) == 2:
+                break
+
+        tb = bars if trail_tf == "5" else c3[dk]
+        tc = [x["close"] for x in tb]
+        E7, E17 = _ema(tc, 7), _ema(tc, 17)
+
+        for n, si in enumerate(sig):
+            off = off1 if n == 0 else off2
+            ref = bars[si]["close"]
+            want = ref - off if bias == "bull" else ref + off
+            t0 = bars[si]["date"]; t1 = t0 + timedelta(minutes=30)
+            ft = fp = None
+            for b in bars:
+                if b["date"] <= t0 or b["date"] > t1:
+                    continue
+                if bias == "bull" and b["low"] <= want:
+                    ft, fp = b["date"], want; break
+                if bias == "bear" and b["high"] >= want:
+                    ft, fp = b["date"], want; break
+            if not ft:
+                continue
+
+            armed = not arm_trail
+            xp = xw = None
+            for j, b in enumerate(tb):
+                if b["date"] <= ft:
+                    continue
+                mv = (b["low"] - fp) if bias == "bull" else (fp - b["high"])
+                if mv <= -stop_pts:
+                    xp = fp - stop_pts if bias == "bull" else fp + stop_pts
+                    xw = "stop"; break
+                ab = b["close"] > E7[j] if bias == "bull" else b["close"] < E7[j]
+                if not armed:
+                    if ab:
+                        armed = True
+                    continue
+                if bias == "bull":
+                    if b["close"] < E17[j]:
+                        xp, xw = b["close"], "ema17"; break
+                    if b["close"] < E7[j]:
+                        xp, xw = b["close"], "ema7"; break
+                else:
+                    if b["close"] > E17[j]:
+                        xp, xw = b["close"], "ema17"; break
+                    if b["close"] > E7[j]:
+                        xp, xw = b["close"], "ema7"; break
+            if xp is None:
+                xp, xw = tb[-1]["close"], "eod"
+            pts = (xp - fp) if bias == "bull" else (fp - xp)
+            trades.append({"date": dk, "rvr": round(r, 2), "bias": bias,
+                           "leg": n + 1, "pts": round(pts, 2), "exit_why": xw})
+
+    if not trades:
+        return jsonify({"error": "no trades", "sessions": len(dks)}), 200
+
+    def st(sel):
+        if not sel:
+            return None
+        p = sorted(t["pts"] for t in sel)
+        n = len(p)
+        w = [x for x in p if x > 0]; l = [x for x in p if x <= 0]
+        return {"trades": n,
+                "win_rate_pct": round(len(w) / n * 100, 1),
+                "mean_pts": round(sum(p) / n, 2),
+                "total_pts": round(sum(p), 1),
+                "avg_win": round(sum(w) / len(w), 2) if w else None,
+                "avg_loss": round(sum(l) / len(l), 2) if l else None,
+                "best": p[-1], "worst": p[0]}
+
+    buckets = {}
+    for lo_, hi_, lbl in ((0, .8, "rvr_lt_0.8"), (.8, 1.2, "rvr_0.8_1.2"),
+                          (1.2, 1.8, "rvr_1.2_1.8"), (1.8, 99, "rvr_gt_1.8")):
+        buckets[lbl] = st([t for t in trades if lo_ <= t["rvr"] < hi_])
+
+    return jsonify({"sessions": len(dks), "trail_tf": trail_tf,
+                    "switches": {"ignore_c1": ignore_c1, "arm_trail": arm_trail,
+                                 "minrvr": minrvr, "stop_pts": stop_pts,
+                                 "off1": off1, "off2": off2},
+                    "overall": st(trades),
+                    "by_opening_participation": buckets,
+                    "sample": trades[-10:]})
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
