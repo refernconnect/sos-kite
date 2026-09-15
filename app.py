@@ -1079,7 +1079,234 @@ def cas_rank_route():
     return jsonify({"universe_source": uni_src, "universe_size": len(universe),
                     "offset": offset, "limit": limit, "threshold_pct": th,
                     "cost_bps": cost_bps, "symbols": out})
-    
+    # ─── OPENING BIAS RULE BACKTEST ───────────────────────────────────────
+# Sid's rules: open=low/high bias + 5m opening-range break + MACD/EMA
+# crossover entries, EMA7/EMA17 trailing exits on 3m.
+# Signals on 5m Nifty spot. Results reported in INDEX POINTS.
+
+def _ema(vals, n):
+    k = 2.0 / (n + 1.0)
+    out, e = [], None
+    for v in vals:
+        e = v if e is None else (v - e) * k + e
+        out.append(e)
+    return out
+
+
+def _macd(vals, fast=12, slow=26, sig=9):
+    ef, es = _ema(vals, fast), _ema(vals, slow)
+    line = [a - b for a, b in zip(ef, es)]
+    return line, _ema(line, sig)
+
+
+def _by_day(candles):
+    d = {}
+    for c in candles:
+        d.setdefault(c["date"].strftime("%Y-%m-%d"), []).append(c)
+    for k in d:
+        d[k].sort(key=lambda c: c["date"])
+    return d
+
+
+def _pull(token, days, interval):
+    to_d = datetime.now(IST)
+    from_d = to_d - timedelta(days=days)
+    out, cs = [], from_d
+    while cs < to_d:
+        ce = min(cs + timedelta(days=55), to_d)
+        try:
+            out += kite.historical_data(token,
+                                        cs.strftime("%Y-%m-%d %H:%M:%S"),
+                                        ce.strftime("%Y-%m-%d %H:%M:%S"),
+                                        interval)
+        except Exception:
+            pass
+        cs = ce + timedelta(days=1)
+        time.sleep(0.4)
+    return out
+
+
+@app.route("/ob_backtest")
+def ob_backtest_route():
+    """Backtest the opening-bias rules on Nifty spot.
+
+    Query: ?days=120&tol=2&stop_pts=30&off1=14&off2=10
+      tol      = points tolerance for 'open == low/high'
+      stop_pts = index-point stop (15 premium pts ~ 30 index pts at delta 0.5)
+      off1/off2= limit-entry pullback required, in index points
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+
+    days = int(request.args.get("days", 120))
+    tol = float(request.args.get("tol", 2.0))
+    stop_pts = float(request.args.get("stop_pts", 30.0))
+    off1 = float(request.args.get("off1", 14.0))
+    off2 = float(request.args.get("off2", 10.0))
+
+    c5 = _by_day(_pull(NIFTY_TOKEN, days, "5minute"))
+    c3 = _by_day(_pull(NIFTY_TOKEN, days, "3minute"))
+    if not c5:
+        return jsonify({"error": "no 5m candles returned"}), 500
+
+    trades, day_log = [], []
+
+    for dk in sorted(c5.keys()):
+        bars = c5[dk]
+        if len(bars) < 12 or dk not in c3:
+            continue
+
+        op = bars[0]["open"]
+        h1, l1 = bars[0]["high"], bars[0]["low"]
+
+        # --- condition 2: opening-range break + next-candle confirmation ---
+        bias2, brk_i = None, None
+        for i in range(1, min(len(bars) - 1, 24)):
+            b = bars[i]
+            if b["high"] > h1:
+                nxt = bars[i + 1]
+                bias2 = "bull" if nxt["close"] > nxt["open"] else None
+                brk_i = i + 1
+                break
+            if b["low"] < l1:
+                nxt = bars[i + 1]
+                bias2 = "bear" if nxt["close"] < nxt["open"] else None
+                brk_i = i + 1
+                break
+        if not bias2:
+            day_log.append({"date": dk, "bias": None, "why": "no range confirm"})
+            continue
+
+        # --- condition 1: open == low (bull) / open == high (bear), as of break ---
+        lo = min(b["low"] for b in bars[:brk_i + 1])
+        hi = max(b["high"] for b in bars[:brk_i + 1])
+        bias1 = None
+        if lo >= op - tol:
+            bias1 = "bull"
+        elif hi <= op + tol:
+            bias1 = "bear"
+
+        if bias1 != bias2:
+            day_log.append({"date": dk, "bias": None,
+                            "why": "cond1=%s cond2=%s" % (bias1, bias2)})
+            continue
+        bias = bias1
+        day_log.append({"date": dk, "bias": bias, "why": "confirmed"})
+
+        # --- indicators on 5m closes ---
+        closes = [b["close"] for b in bars]
+        e7, e17 = _ema(closes, 7), _ema(closes, 17)
+        ml, msig = _macd(closes)
+
+        def crossed(i):
+            if i < 1:
+                return False
+            if bias == "bull":
+                return ((e7[i - 1] <= e17[i - 1] and e7[i] > e17[i]) or
+                        (ml[i - 1] <= msig[i - 1] and ml[i] > msig[i]))
+            return ((e7[i - 1] >= e17[i - 1] and e7[i] < e17[i]) or
+                    (ml[i - 1] >= msig[i - 1] and ml[i] < msig[i]))
+
+        # --- entries: first two crossovers after confirmation ---
+        entries, sig_idx = [], []
+        for i in range(brk_i + 1, len(bars)):
+            if crossed(i):
+                sig_idx.append(i)
+            if len(sig_idx) == 2:
+                break
+
+        bars3 = c3[dk]
+        cl3 = [b["close"] for b in bars3]
+        e7_3, e17_3 = _ema(cl3, 7), _ema(cl3, 17)
+
+        for n, si in enumerate(sig_idx):
+            off = off1 if n == 0 else off2
+            ref = bars[si]["close"]
+            want = ref - off if bias == "bull" else ref + off
+            t_sig = bars[si]["date"]
+            t_exp = t_sig + timedelta(minutes=30)
+
+            fill_t, fill_p = None, None
+            for b in bars:
+                if b["date"] <= t_sig or b["date"] > t_exp:
+                    continue
+                if bias == "bull" and b["low"] <= want:
+                    fill_t, fill_p = b["date"], want
+                    break
+                if bias == "bear" and b["high"] >= want:
+                    fill_t, fill_p = b["date"], want
+                    break
+            if not fill_t:
+                trades.append({"date": dk, "leg": n + 1, "bias": bias,
+                               "filled": False, "pts": 0.0, "exit": "unfilled"})
+                continue
+
+            # --- exit walk on 3m ---
+            exit_p, exit_why = None, None
+            for j, b in enumerate(bars3):
+                if b["date"] <= fill_t:
+                    continue
+                mv = (b["low"] - fill_p) if bias == "bull" else (fill_p - b["high"])
+                if mv <= -stop_pts:
+                    exit_p = fill_p - stop_pts if bias == "bull" else fill_p + stop_pts
+                    exit_why = "stop"
+                    break
+                if bias == "bull":
+                    if b["close"] < e17_3[j]:
+                        exit_p, exit_why = b["close"], "ema17"
+                        break
+                    if b["close"] < e7_3[j]:
+                        exit_p, exit_why = b["close"], "ema7"
+                        break
+                else:
+                    if b["close"] > e17_3[j]:
+                        exit_p, exit_why = b["close"], "ema17"
+                        break
+                    if b["close"] > e7_3[j]:
+                        exit_p, exit_why = b["close"], "ema7"
+                        break
+            if exit_p is None:
+                exit_p, exit_why = bars3[-1]["close"], "eod"
+
+            pts = (exit_p - fill_p) if bias == "bull" else (fill_p - exit_p)
+            trades.append({"date": dk, "leg": n + 1, "bias": bias, "filled": True,
+                           "entry": round(fill_p, 2), "exit": round(exit_p, 2),
+                           "pts": round(pts, 2), "exit_why": exit_why})
+
+    filled = [t for t in trades if t["filled"]]
+    if not filled:
+        return jsonify({"error": "no filled trades", "sessions": len(c5),
+                        "day_log": day_log[-20:]}), 200
+
+    pts = sorted(t["pts"] for t in filled)
+    n = len(pts)
+    mean = sum(pts) / n
+    wins = [p for p in pts if p > 0]
+    losses = [p for p in pts if p <= 0]
+    why = {}
+    for t in filled:
+        why[t["exit_why"]] = why.get(t["exit_why"], 0) + 1
+
+    return jsonify({
+        "sessions_scanned": len(c5),
+        "days_with_bias": sum(1 for d in day_log if d["bias"]),
+        "signals": len(trades),
+        "filled": n,
+        "unfilled": len(trades) - n,
+        "win_rate_pct": round(len(wins) / n * 100, 1),
+        "mean_pts": round(mean, 2),
+        "median_pts": round(pts[n // 2], 2),
+        "total_pts": round(sum(pts), 1),
+        "avg_win_pts": round(sum(wins) / len(wins), 2) if wins else None,
+        "avg_loss_pts": round(sum(losses) / len(losses), 2) if losses else None,
+        "best_pts": pts[-1], "worst_pts": pts[0],
+        "exit_reasons": why,
+        "params": {"tol": tol, "stop_pts": stop_pts, "off1": off1, "off2": off2},
+        "sample": filled[-15:],
+    })
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
+
+
