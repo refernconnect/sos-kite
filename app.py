@@ -519,7 +519,177 @@ def kite_callback():
 @app.route("/health")
 def health():
     return "ok"
+@app.route("/token")
+def token_share():
+    """Share today's Kite access token with sibling services.
 
+    Consumed by sos-stock-radar/token_sync.py and the CAS backfill below.
+    Accepts the secret via X-Token-Secret header (preferred) or ?secret=
+    (kept for backward compatibility with existing token_sync.py).
+    """
+    secret = os.environ.get("TOKEN_SHARE_SECRET", "")
+    if not secret:
+        return jsonify({"error": "TOKEN_SHARE_SECRET not configured"}), 503
+    supplied = request.headers.get("X-Token-Secret") or request.args.get("secret")
+    if supplied != secret:
+        return jsonify({"error": "unauthorized"}), 403
+    with lock:
+        tok = state.get("access_token")
+    if not tok:
+        tok = load_token()
+    if not tok:
+        return jsonify({"token": None, "error": "no token - morning login not done"}), 200
+    return jsonify({"token": tok, "api_key": API_KEY})
+
+
+# ─── CAS BACKFILL (hypothesis 1: does the close mean-revert into the next open?) ───
+
+NIFTY50_SYMBOLS = [
+    "RELIANCE","HDFCBANK","ICICIBANK","BHARTIARTL","INFY","TCS","SBIN","LT",
+    "ITC","AXISBANK","KOTAKBANK","HINDUNILVR","BAJFINANCE","M&M","MARUTI",
+    "SUNPHARMA","NTPC","HCLTECH","TATAMOTORS","ULTRACEMCO","TITAN","ASIANPAINT",
+    "POWERGRID","ADANIENT","TATASTEEL","BAJAJFINSV","ONGC","COALINDIA","NESTLEIND",
+    "JSWSTEEL","WIPRO","GRASIM","ADANIPORTS","TECHM","HINDALCO","CIPLA","DRREDDY",
+    "INDUSINDBK","BAJAJ-AUTO","APOLLOHOSP","EICHERMOT","BPCL","DIVISLAB","TATACONSUM",
+    "HEROMOTOCO","BRITANNIA","SBILIFE","HDFCLIFE","SHRIRAMFIN","TRENT",
+]
+
+CAS_START_DATE = "2026-08-03"   # CAS went live
+
+
+def _cas_day_stats(minute_bars, daily_bars):
+    """Per date: reference VWAP (15:00-15:14) from minute bars, close from daily bars."""
+    from collections import defaultdict
+    by_date = defaultdict(list)
+    last_bar_time = {}
+    for b in minute_bars:
+        d = b["date"]
+        key = d.strftime("%Y-%m-%d")
+        by_date[key].append(b)
+        t = d.strftime("%H:%M")
+        if key not in last_bar_time or t > last_bar_time[key]:
+            last_bar_time[key] = t
+
+    closes, opens = {}, {}
+    for b in daily_bars:
+        key = b["date"].strftime("%Y-%m-%d")
+        closes[key] = b["close"]
+        opens[key] = b["open"]
+
+    out = {}
+    for key, bars in by_date.items():
+        win = [b for b in bars if "15:00" <= b["date"].strftime("%H:%M") <= "15:14"]
+        if not win or key not in closes:
+            continue
+        vol = sum(b.get("volume") or 0 for b in win)
+        if vol > 0:
+            vwap = sum(((b["high"] + b["low"] + b["close"]) / 3.0) * (b.get("volume") or 0)
+                       for b in win) / vol
+        else:
+            vwap = sum(b["close"] for b in win) / len(win)
+        out[key] = {
+            "ref_vwap": round(vwap, 2),
+            "close": closes[key],
+            "next_open": None,
+            "last_minute_bar": last_bar_time.get(key),
+        }
+
+    keys = sorted(out.keys())
+    for i, k in enumerate(keys[:-1]):
+        out[k]["next_open"] = opens.get(keys[i + 1])
+    return out
+
+
+@app.route("/cas_backfill")
+def cas_backfill_route():
+    """Hypothesis 1 study.  Query: ?limit=50&start=2026-08-03
+
+    For every Nifty-50 stock-day since CAS launch, compares the official close
+    against the 15:00-15:14 reference VWAP, then against the NEXT session's open.
+    Tests whether the auction print fades (mean-reverts) or persists.
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+
+    limit = int(request.args.get("limit", 50))
+    start = request.args.get("start", CAS_START_DATE)
+    to_d = datetime.now(IST)
+    from_d = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=IST)
+
+    try:
+        nse = kite.instruments("NSE")
+    except Exception as e:
+        return jsonify({"error": "instruments() failed: %s" % e}), 500
+
+    tokmap = {}
+    for r in nse:
+        if r.get("segment") == "NSE" and r.get("instrument_type") == "EQ":
+            tokmap[r["tradingsymbol"]] = r["instrument_token"]
+
+    rows, skipped = [], []
+    for sym in NIFTY50_SYMBOLS[:limit]:
+        tok = tokmap.get(sym)
+        if not tok:
+            skipped.append({"symbol": sym, "reason": "no instrument token"})
+            continue
+        try:
+            a = from_d.strftime("%Y-%m-%d %H:%M:%S")
+            b = to_d.strftime("%Y-%m-%d %H:%M:%S")
+            mins = kite.historical_data(tok, a, b, "minute")
+            days = kite.historical_data(tok, a, b, "day")
+        except Exception as e:
+            skipped.append({"symbol": sym, "reason": str(e)[:120]})
+            time.sleep(0.4)
+            continue
+
+        for date_key, s in _cas_day_stats(mins, days).items():
+            if not s["next_open"] or not s["ref_vwap"]:
+                continue
+            delta = (s["close"] - s["ref_vwap"]) / s["ref_vwap"] * 100.0
+            nxt = (s["next_open"] - s["close"]) / s["close"] * 100.0
+            rows.append({
+                "symbol": sym, "date": date_key,
+                "ref_vwap": s["ref_vwap"], "close": s["close"],
+                "delta_pct": round(delta, 3),
+                "next_open_pct": round(nxt, 3),
+                "last_minute_bar": s["last_minute_bar"],
+            })
+        time.sleep(0.4)
+
+    if not rows:
+        return jsonify({"error": "no rows built", "skipped": skipped[:20]}), 500
+
+    n = len(rows)
+    mean_d = sum(r["delta_pct"] for r in rows) / n
+    mean_n = sum(r["next_open_pct"] for r in rows) / n
+    cov = sum((r["delta_pct"] - mean_d) * (r["next_open_pct"] - mean_n) for r in rows)
+    vd = sum((r["delta_pct"] - mean_d) ** 2 for r in rows) ** 0.5
+    vn = sum((r["next_open_pct"] - mean_n) ** 2 for r in rows) ** 0.5
+    corr = cov / (vd * vn) if vd and vn else 0.0
+
+    nonzero = [r for r in rows if abs(r["delta_pct"]) > 0.01]
+    fades = sum(1 for r in nonzero if r["delta_pct"] * r["next_open_pct"] < 0)
+    big = [r for r in rows if abs(r["delta_pct"]) >= 0.5]
+    big_fades = sum(1 for r in big if r["delta_pct"] * r["next_open_pct"] < 0)
+
+    bar_times = {}
+    for r in rows:
+        bar_times[r["last_minute_bar"]] = bar_times.get(r["last_minute_bar"], 0) + 1
+
+    return jsonify({
+        "observations": n,
+        "symbols": len(set(r["symbol"] for r in rows)),
+        "sessions": len(set(r["date"] for r in rows)),
+        "mean_delta_pct": round(mean_d, 4),
+        "mean_next_open_pct": round(mean_n, 4),
+        "correlation_delta_vs_next_open": round(corr, 4),
+        "fade_rate_all": round(fades / len(nonzero) * 100, 2) if nonzero else None,
+        "fade_rate_big_moves": round(big_fades / len(big) * 100, 2) if big else None,
+        "big_move_count": len(big),
+        "last_minute_bar_distribution": bar_times,
+        "skipped": skipped[:20],
+        "sample": rows[:15],
+    })
 
 @app.route("/backtest")
 def backtest_route():
