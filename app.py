@@ -3234,6 +3234,320 @@ def ovn3_route():
                     "contracts": [per_contract(e, x) for e, x in futs]})
 
 
+
+@app.route("/vrp")
+def vrp_route():
+    """Is the Nifty variance risk premium concentrated OVERNIGHT?
+
+    Tests Bhat (2024, J. Futures Markets): short delta-hedged Nifty option
+    returns are positive and significant OVERNIGHT and negative INTRADAY --
+    i.e. the variance risk premium is compensation for overnight risk.
+
+    Per session, splits the day at two clock times and measures realised
+    variance in each leg against the implied variance priced by India VIX at
+    the start of that leg. The decisive number is the gap between the
+    overnight share of CALENDAR time (what a seller is paid time-decay for)
+    and the overnight share of realised VARIANCE (what the seller actually
+    pays out). A large positive gap is the mechanism the paper proposes.
+
+    Friday entries are flagged separately: a weekend carries ~66 calendar
+    hours of decay against a single overnight gap of variance.
+
+    ?days=900 &entry=15:20 &exit=09:20
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+    g = request.args.get
+    days = int(g("days", 900))
+    entry_hhmm = g("entry", "15:20")
+    exit_hhmm = g("exit", "09:20")
+
+    try:
+        inst = kite.instruments("NSE")
+    except Exception as e:
+        return jsonify({"error": "instruments() failed: %s" % e}), 500
+    vix_tok = next((r["instrument_token"] for r in inst
+                    if (r.get("tradingsymbol") or "").upper().replace(" ", "")
+                    in ("INDIAVIX", "INDIAVIX-INDEX")), None)
+    if not vix_tok:
+        cands = sorted({r.get("tradingsymbol") for r in inst
+                        if "VIX" in (r.get("tradingsymbol") or "").upper()})
+        return jsonify({"error": "INDIA VIX token not found", "candidates": cands[:20]}), 500
+
+    nif = _by_day(_pull(NIFTY_TOKEN, days, "5minute"))
+    vix = _by_day(_pull(vix_tok, days, "5minute"))
+    dks = sorted(set(nif.keys()) & set(vix.keys()))
+    if len(dks) < 100:
+        return jsonify({"error": "too few overlapping sessions", "n": len(dks)}), 500
+
+    rows = []
+    for i in range(1, len(dks)):
+        pd_, cd = dks[i - 1], dks[i]
+        pe = bar_at(nif[pd_], entry_hhmm)
+        cx = bar_at(nif[cd], exit_hhmm)
+        ce = bar_at(nif[cd], entry_hhmm)
+        vpe = bar_at(vix[pd_], entry_hhmm)
+        vcx = bar_at(vix[cd], exit_hhmm)
+        if not (pe and cx and ce and vpe and vcx):
+            continue
+        import math
+        r_on = math.log(cx["open"] / pe["open"])
+        r_id = math.log(ce["open"] / cx["open"])
+        hrs_on = (cx["date"] - pe["date"]).total_seconds() / 3600.0
+        hrs_id = (ce["date"] - cx["date"]).total_seconds() / 3600.0
+        if hrs_on <= 0 or hrs_id <= 0:
+            continue
+        rows.append({
+            "d": cd, "dow_entry": pe["date"].weekday(),
+            "r_on": r_on, "r_id": r_id,
+            "var_on": r_on ** 2, "var_id": r_id ** 2,
+            "hrs_on": hrs_on, "hrs_id": hrs_id,
+            "vix_on": vpe["open"], "vix_id": vcx["open"],
+            "weekend": hrs_on > 30,
+        })
+    if len(rows) < 100:
+        return jsonify({"error": "too few paired legs", "n": len(rows)}), 500
+
+    def ann_vol(mean_var, hours):
+        """Annualised vol implied by a mean per-leg variance over `hours`."""
+        if mean_var <= 0 or hours <= 0:
+            return None
+        per_hour = mean_var / hours
+        return round((per_hour * 24 * 365) ** 0.5 * 100, 2)
+
+    def block(sel):
+        if len(sel) < 20:
+            return None
+        n = len(sel)
+        mvo = sum(x["var_on"] for x in sel) / n
+        mvi = sum(x["var_id"] for x in sel) / n
+        mho = sum(x["hrs_on"] for x in sel) / n
+        mhi = sum(x["hrs_id"] for x in sel) / n
+        var_share = mvo / (mvo + mvi) if (mvo + mvi) > 0 else None
+        cal_share = mho / (mho + mhi)
+        # classic VRP: implied daily variance at entry vs realised over the
+        # full entry->entry cycle
+        iv = [((x["vix_on"] / 100.0) ** 2) / 252.0 for x in sel]
+        rv = [x["var_on"] + x["var_id"] for x in sel]
+        vrp = [a - b for a, b in zip(iv, rv)]
+        mv, tv = _tstat([v * 1e4 for v in vrp])
+        return {
+            "n": n,
+            "realised_vol_overnight_annualised_pct": ann_vol(mvo, mho),
+            "realised_vol_intraday_annualised_pct": ann_vol(mvi, mhi),
+            "mean_vix_at_entry": round(sum(x["vix_on"] for x in sel) / n, 2),
+            "overnight_share_of_realised_variance": round(var_share, 3) if var_share else None,
+            "overnight_share_of_calendar_time": round(cal_share, 3),
+            "GAP_calendar_minus_variance": round(cal_share - var_share, 3) if var_share else None,
+            "mean_hours_overnight": round(mho, 1),
+            "total_VRP_per_cycle_x1e4": {"mean": round(mv, 2), "t": round(tv, 2)},
+            "overnight_move_bps": {
+                "mean_abs": round(sum(abs(x["r_on"]) for x in sel) / n * 10000, 1),
+                "mean_signed": round(sum(x["r_on"] for x in sel) / n * 10000, 2)},
+            "intraday_move_bps": {
+                "mean_abs": round(sum(abs(x["r_id"]) for x in sel) / n * 10000, 1),
+                "mean_signed": round(sum(x["r_id"] for x in sel) / n * 10000, 2)},
+        }
+
+    yrs = sorted(set(r["d"][:4] for r in rows))
+    vs = sorted(x["vix_on"] for x in rows)
+    q1, q3 = vs[len(vs) // 3], vs[2 * len(vs) // 3]
+    return jsonify({
+        "sessions": len(rows), "from": rows[0]["d"], "to": rows[-1]["d"],
+        "entry": entry_hhmm, "exit": exit_hhmm,
+        "how_to_read": ("GAP_calendar_minus_variance > 0 means an overnight-only "
+                        "seller is paid for more calendar time than the variance "
+                        "actually delivered in that window. That gap is the edge "
+                        "the paper attributes to overnight risk compensation. "
+                        "Option P&L is NOT measured here - no historical chain."),
+        "all": block(rows),
+        "weeknights_only": block([r for r in rows if not r["weekend"]]),
+        "weekends_only": block([r for r in rows if r["weekend"]]),
+        "by_year": {y: block([r for r in rows if r["d"][:4] == y]) for y in yrs},
+        "by_vix_tercile": {
+            "low_vix": block([r for r in rows if r["vix_on"] <= q1]),
+            "mid_vix": block([r for r in rows if q1 < r["vix_on"] <= q3]),
+            "high_vix": block([r for r in rows if r["vix_on"] > q3])},
+        "vix_tercile_bounds": [round(q1, 2), round(q3, 2)],
+    })
+
+
+
+# ─── OVERNIGHT vs INTRADAY SHORT-STRADDLE P&L ON REAL NIFTY OPTION PRICES ───
+_OPT = {"state": "idle", "done": 0, "total": 0, "err": None, "started": None, "res": None}
+
+
+@app.route("/opt_start")
+def opt_start_route():
+    """Background job: sell the nearest-ATM Nifty straddle at `entry`, buy it
+    back at `exit` next session (OVERNIGHT leg) vs sell at `exit`, buy at
+    `entry` same session (INTRADAY leg). Real option bars from the monthly
+    contracts Kite still serves (currently listed ones only, so ~2-3 months).
+    Direct test of Bhat (2024): seller should win overnight, lose intraday.
+    ?days=75&strikes=24&contracts=2&entry=15:20&exit=09:20  -> poll /opt_status"""
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+    if _OPT["state"] == "running":
+        return jsonify({"state": "running", "done": _OPT["done"], "total": _OPT["total"]}), 200
+    g = request.args.get
+    days = int(g("days", 75)); nstrikes = int(g("strikes", 24))
+    ncon = int(g("contracts", 2)); entry_hhmm = g("entry", "15:20"); exit_hhmm = g("exit", "09:20")
+
+    def job():
+        try:
+            _OPT.update({"state": "running", "done": 0, "total": 0, "err": None,
+                         "started": datetime.now(IST).isoformat(), "res": None})
+            nfo = kite.instruments("NFO")
+            today = datetime.now(IST).date()
+
+            def expd(x):
+                e = x.get("expiry")
+                if hasattr(e, "year"):
+                    return e.date() if hasattr(e, "hour") else e
+                try:
+                    return datetime.strptime(str(e)[:10], "%Y-%m-%d").date()
+                except Exception:
+                    return None
+
+            opts = [(expd(x), x) for x in nfo
+                    if x.get("name") == "NIFTY" and x.get("segment") == "NFO-OPT"]
+            opts = [(e, x) for e, x in opts if e and e >= today]
+            # monthly = latest expiry within each calendar month
+            bym = {}
+            for e, x in opts:
+                k = (e.year, e.month)
+                bym[k] = max(bym.get(k, e), e)
+            monthlies = sorted(set(bym.values()))[:ncon]
+
+            nif = _by_day(_pull(NIFTY_TOKEN, days, "5minute"))
+            ndays = sorted(nif.keys())
+            spot_now = nif[ndays[-1]][-1]["close"]
+            lo = min(min(c["low"] for c in nif[d]) for d in ndays)
+            hi = max(max(c["high"] for c in nif[d]) for d in ndays)
+
+            plan = []
+            for e in monthlies:
+                ks = sorted({float(x["strike"]) for ee, x in opts if ee == e
+                             and lo * 0.985 <= float(x["strike"]) <= hi * 1.015})
+                ks = sorted(ks, key=lambda k: abs(k - spot_now))[:nstrikes]
+                for k in ks:
+                    ce = next((x for ee, x in opts if ee == e and float(x["strike"]) == k
+                               and x.get("instrument_type") == "CE"), None)
+                    pe = next((x for ee, x in opts if ee == e and float(x["strike"]) == k
+                               and x.get("instrument_type") == "PE"), None)
+                    if ce and pe:
+                        plan.append((e, k, ce, pe))
+            _OPT["total"] = len(plan)
+
+            chain = {}  # (expiry, strike) -> {"CE": byday, "PE": byday}
+            for e, k, ce, pe in plan:
+                chain[(e, k)] = {"CE": _by_day(_pull(ce["instrument_token"], days, "5minute")),
+                                 "PE": _by_day(_pull(pe["instrument_token"], days, "5minute"))}
+                _OPT["done"] += 1
+
+            legs = []
+            for e in monthlies:
+                strikes = sorted(k for (ee, k) in chain if ee == e)
+                if not strikes:
+                    continue
+                for i, d in enumerate(ndays):
+                    dd = datetime.strptime(d, "%Y-%m-%d").date()
+                    if dd > e:
+                        continue
+                    dte = (e - dd).days
+                    # intraday leg: sell at exit_hhmm, buy at entry_hhmm, same day
+                    sx = bar_at(nif[d], exit_hhmm); se = bar_at(nif[d], entry_hhmm)
+                    if sx and se:
+                        k = min(strikes, key=lambda kk: abs(kk - sx["open"]))
+                        c = chain[(e, k)]
+                        c1, p1 = bar_at(c["CE"].get(d, []), exit_hhmm), bar_at(c["PE"].get(d, []), exit_hhmm)
+                        c2, p2 = bar_at(c["CE"].get(d, []), entry_hhmm), bar_at(c["PE"].get(d, []), entry_hhmm)
+                        if c1 and p1 and c2 and p2 and (c1["volume"] or 0) > 0 and (p1["volume"] or 0) > 0:
+                            prem0 = c1["open"] + p1["open"]; prem1 = c2["open"] + p2["open"]
+                            if prem0 > 0:
+                                legs.append({"leg": "intraday", "d": d, "exp": str(e), "k": k, "dte": dte,
+                                             "prem0": prem0, "pnl_pts": prem0 - prem1,
+                                             "pnl_pct": (prem0 - prem1) / prem0 * 100,
+                                             "spot_move_bps": (se["open"] / sx["open"] - 1) * 1e4,
+                                             "weekend": False})
+                    # overnight leg: sell at entry_hhmm on d, buy at exit_hhmm on next session
+                    if i + 1 < len(ndays) and dd < e:
+                        nd = ndays[i + 1]
+                        se = bar_at(nif[d], entry_hhmm); nx = bar_at(nif[nd], exit_hhmm)
+                        if se and nx:
+                            k = min(strikes, key=lambda kk: abs(kk - se["open"]))
+                            c = chain[(e, k)]
+                            c1, p1 = bar_at(c["CE"].get(d, []), entry_hhmm), bar_at(c["PE"].get(d, []), entry_hhmm)
+                            c2, p2 = bar_at(c["CE"].get(nd, []), exit_hhmm), bar_at(c["PE"].get(nd, []), exit_hhmm)
+                            if c1 and p1 and c2 and p2 and (c1["volume"] or 0) > 0 and (p1["volume"] or 0) > 0:
+                                prem0 = c1["open"] + p1["open"]; prem1 = c2["open"] + p2["open"]
+                                hrs = (nx["date"] - se["date"]).total_seconds() / 3600.0
+                                if prem0 > 0:
+                                    legs.append({"leg": "overnight", "d": d, "exp": str(e), "k": k, "dte": dte,
+                                                 "prem0": prem0, "pnl_pts": prem0 - prem1,
+                                                 "pnl_pct": (prem0 - prem1) / prem0 * 100,
+                                                 "spot_move_bps": (nx["open"] / se["open"] - 1) * 1e4,
+                                                 "weekend": hrs > 30})
+            # de-duplicate: if two contracts cover the same day, keep the nearer expiry
+            best = {}
+            for L in legs:
+                key = (L["leg"], L["d"])
+                if key not in best or L["exp"] < best[key]["exp"]:
+                    best[key] = L
+            legs = list(best.values())
+
+            def blk(sel):
+                if len(sel) < 8:
+                    return {"n": len(sel)}
+                pts = [x["pnl_pts"] for x in sel]; pct = [x["pnl_pct"] for x in sel]
+                m, t = _tstat(pts) if len(pts) >= 20 else (sum(pts) / len(pts), None)
+                mp = sum(pct) / len(pct)
+                return {"n": len(sel), "seller_pnl_pts_mean": round(m, 2),
+                        "t": round(t, 2) if t is not None else None,
+                        "seller_pnl_pct_of_premium_mean": round(mp, 2),
+                        "win_pct": round(sum(1 for x in pts if x > 0) / len(pts) * 100, 1),
+                        "worst_pts": round(min(pts), 1), "best_pts": round(max(pts), 1),
+                        "mean_premium_sold": round(sum(x["prem0"] for x in sel) / len(sel), 1),
+                        "mean_abs_spot_move_bps": round(sum(abs(x["spot_move_bps"]) for x in sel) / len(sel), 1)}
+
+            on = [L for L in legs if L["leg"] == "overnight"]
+            idl = [L for L in legs if L["leg"] == "intraday"]
+            _OPT["res"] = {
+                "contracts": [str(e) for e in monthlies], "strikes_per_contract": nstrikes,
+                "sessions_covered": len({L["d"] for L in legs}),
+                "span": [min(L["d"] for L in legs), max(L["d"] for L in legs)] if legs else None,
+                "OVERNIGHT_short_straddle": blk(on),
+                "INTRADAY_short_straddle": blk(idl),
+                "overnight_weeknights": blk([L for L in on if not L["weekend"]]),
+                "overnight_weekends": blk([L for L in on if L["weekend"]]),
+                "overnight_by_dte": {"dte_gt_15": blk([L for L in on if L["dte"] > 15]),
+                                     "dte_6_15": blk([L for L in on if 6 <= L["dte"] <= 15]),
+                                     "dte_le_5": blk([L for L in on if L["dte"] <= 5])},
+                "intraday_by_dte": {"dte_gt_15": blk([L for L in idl if L["dte"] > 15]),
+                                    "dte_6_15": blk([L for L in idl if 6 <= L["dte"] <= 15]),
+                                    "dte_le_5": blk([L for L in idl if L["dte"] <= 5])},
+                "note": ("Unhedged ATM straddle, nearest strike to spot at leg start, "
+                         "option bar OPEN prices, no costs. Seller-positive = premium fell. "
+                         "Only currently-listed monthly contracts exist on Kite, hence the short span."),
+            }
+            _OPT["state"] = "done"
+        except Exception as e:
+            _OPT["err"] = str(e)[:300]
+            _OPT["state"] = "error"
+
+    threading.Thread(target=job, daemon=True).start()
+    return jsonify({"state": "started", "days": days, "strikes": nstrikes, "contracts": ncon}), 200
+
+
+@app.route("/opt_status")
+def opt_status_route():
+    base = {"state": _OPT["state"], "done": _OPT["done"], "total": _OPT["total"],
+            "err": _OPT["err"], "started_ist": _OPT["started"]}
+    if _OPT["state"] == "done" and _OPT["res"]:
+        base.update(_OPT["res"])
+    return jsonify(base)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
