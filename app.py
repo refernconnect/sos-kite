@@ -1782,6 +1782,173 @@ def vw_route():
         "sample": trades[-10:],
     })
 
+@app.route("/vw2")
+def vw2_route():
+    """VWAP-reclaim v2. Signal on 3m, entry/management on 5m. Long only.
+
+    ?days=664 &src=bees|index &gmin_pct=0.13 &gmax_pct=0.21
+    &stop_pct=0.128 &pivot_n=2 &need_hh=1
+    src=bees uses NIFTYBEES (real traded volume -> real VWAP).
+    src=index uses Nifty spot (no volume -> TWAP fallback).
+    Band and stop are percentages of price, so both instruments compare.
+    Defaults: 0.13%-0.21% ~= 30-50 Nifty points; stop 0.128% ~= 30 points.
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+
+    g = request.args.get
+    days = int(g("days", 664)); src = g("src", "bees")
+    gmin = float(g("gmin_pct", 0.13)) / 100.0
+    gmax = float(g("gmax_pct", 0.21)) / 100.0
+    stop_pct = float(g("stop_pct", 0.128)) / 100.0
+    pn = int(g("pivot_n", 2)); need_hh = g("need_hh", "1") == "1"
+
+    if src == "bees":
+        try:
+            inst = kite.instruments("NSE")
+        except Exception as e:
+            return jsonify({"error": "instruments() failed: %s" % e}), 500
+        tok = next((r["instrument_token"] for r in inst
+                    if r.get("tradingsymbol") == "NIFTYBEES"
+                    and r.get("instrument_type") == "EQ"), None)
+        if not tok:
+            return jsonify({"error": "NIFTYBEES token not found"}), 500
+    else:
+        tok = NIFTY_TOKEN
+
+    c5 = _by_day(_pull(tok, days, "5minute"))
+    c3 = _by_day(_pull(tok, days, "3minute"))
+    if not c5 or not c3:
+        return jsonify({"error": "no candles", "src": src}), 500
+
+    def vwap(bars):
+        tot = sum((b.get("volume") or 0) for b in bars)
+        cp = cv = 0.0; out = []
+        for b in bars:
+            tp = (b["high"] + b["low"] + b["close"]) / 3.0
+            w = (b.get("volume") or 0) if tot > 0 else 1.0
+            cp += tp * w; cv += w
+            out.append(cp / cv if cv else tp)
+        return out, tot > 0
+
+    trades, vol_days, sig_days = [], 0, 0
+
+    for dk in sorted(c5.keys()):
+        if dk not in c3:
+            continue
+        b5, b3 = c5[dk], c3[dk]
+        if len(b5) < 20 or len(b3) < 30:
+            continue
+        cl5 = [b["close"] for b in b5]
+        cl3 = [b["close"] for b in b3]
+        e7_5, e9_5 = _ema(cl5, 7), _ema(cl5, 9)
+        e9_3 = _ema(cl3, 9)
+        vw5, hv = vwap(b5)
+        vw3, _ = vwap(b3)
+        if hv:
+            vol_days += 1
+
+        piv = []
+        for i in range(pn, len(b3) - pn):
+            h = b3[i]["high"]
+            if all(b3[j]["high"] < h for j in range(i - pn, i)) and \
+               all(b3[j]["high"] < h for j in range(i + 1, i + pn + 1)):
+                piv.append(i)
+
+        sig_t = None
+        for pi in piv:
+            ci = pi + pn
+            if ci >= len(b3) - 2:
+                continue
+            if need_hh:
+                pr = [p for p in piv if p < pi]
+                if not pr or b3[pi]["high"] <= b3[pr[-1]]["high"]:
+                    continue
+            if cl3[ci] <= e9_3[ci]:
+                continue
+            d = (vw3[ci] - cl3[ci]) / cl3[ci] if cl3[ci] else 0
+            if not (gmin <= d <= gmax):
+                continue
+            sig_t = b3[ci]["date"]; break
+        if sig_t is None:
+            continue
+
+        ei = None
+        for k, b in enumerate(b5):
+            if b["date"] >= sig_t:
+                ei = k; break
+        if ei is None or ei >= len(b5) - 2:
+            continue
+        sig_days += 1
+
+        legs = [{"e": cl5[ei], "leg": 1}]
+        added = False
+        for j in range(ei + 1, len(b5)):
+            if not legs:
+                break
+            if not added and e9_5[j] > vw5[j] and e9_5[j-1] <= vw5[j-1]:
+                legs.append({"e": cl5[j], "leg": 2}); added = True
+                continue
+            c = cl5[j]
+            for lg in list(legs):
+                if (b5[j]["low"] - lg["e"]) / lg["e"] <= -stop_pct:
+                    trades.append({"date": dk, "leg": lg["leg"],
+                                   "bps": round(-stop_pct * 10000, 1), "why": "stop"})
+                    legs.remove(lg)
+            if not legs:
+                break
+            if c < e9_5[j]:
+                for lg in legs:
+                    trades.append({"date": dk, "leg": lg["leg"],
+                                   "bps": round((c - lg["e"]) / lg["e"] * 10000, 1),
+                                   "why": "ema9"})
+                legs = []; break
+            if c < e7_5[j] and len(legs) > 1:
+                lg = legs.pop(0)
+                trades.append({"date": dk, "leg": lg["leg"],
+                               "bps": round((c - lg["e"]) / lg["e"] * 10000, 1),
+                               "why": "ema7"})
+        for lg in legs:
+            trades.append({"date": dk, "leg": lg["leg"],
+                           "bps": round((cl5[-1] - lg["e"]) / lg["e"] * 10000, 1),
+                           "why": "eod"})
+
+    if not trades:
+        return jsonify({"src": src, "sessions": len(c5), "signal_days": sig_days,
+                        "trades": 0,
+                        "vwap_source": "volume" if vol_days else "twap_no_volume",
+                        "params": {"gmin_pct": gmin*100, "gmax_pct": gmax*100}}), 200
+
+    p = sorted(t["bps"] for t in trades)
+    n = len(p)
+    w = [x for x in p if x > 0]; l = [x for x in p if x <= 0]
+    why = {}
+    for t in trades:
+        why[t["why"]] = why.get(t["why"], 0) + 1
+    l1 = [t["bps"] for t in trades if t["leg"] == 1]
+    l2 = [t["bps"] for t in trades if t["leg"] == 2]
+    NIF = 23500.0
+
+    return jsonify({
+        "src": src, "sessions": len(c5), "signal_days": sig_days,
+        "vwap_source": "volume" if vol_days else "twap_no_volume",
+        "days_with_volume": vol_days,
+        "trades": n, "win_rate_pct": round(len(w) / n * 100, 1),
+        "mean_bps": round(sum(p) / n, 1), "median_bps": round(p[n // 2], 1),
+        "total_bps": round(sum(p), 1),
+        "mean_nifty_pts_equiv": round(sum(p) / n / 10000 * NIF, 2),
+        "avg_win_bps": round(sum(w) / len(w), 1) if w else None,
+        "avg_loss_bps": round(sum(l) / len(l), 1) if l else None,
+        "best_bps": p[-1], "worst_bps": p[0],
+        "leg1": {"n": len(l1), "mean_bps": round(sum(l1)/len(l1), 1)} if l1 else None,
+        "leg2": {"n": len(l2), "mean_bps": round(sum(l2)/len(l2), 1)} if l2 else None,
+        "exit_reasons": why,
+        "params": {"gmin_pct": round(gmin*100, 3), "gmax_pct": round(gmax*100, 3),
+                   "stop_pct": round(stop_pct*100, 3), "pivot_n": pn,
+                   "need_hh": need_hh},
+        "sample": trades[-10:],
+    })
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
