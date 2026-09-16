@@ -1949,6 +1949,203 @@ def vw2_route():
         "sample": trades[-10:],
     })
 
+@app.route("/vw3")
+def vw3_route():
+    """VWAP reclaim ENTRY. Filter on 3m, trigger/management on 5m. Long only.
+
+    ?days=664 &src=bees|index &use_filter=1 &max_wait=60
+    &stop_pct=0.128 &pivot_n=2 &need_hh=1 &multi=0
+
+    Filter  (3m, optional): pivot high above prior pivot + close > EMA9
+                            + price BELOW VWAP
+    Trigger (5m): EMA9 crosses ABOVE VWAP  -> buy lot 1
+    Add     (5m): first close above EMA7 and above VWAP -> buy lot 2
+    Stop:   5m close back below VWAP, or stop_pct adverse, whichever first
+    Exit:   close < EMA7 (still >= EMA9) -> 1 lot; close < EMA9 -> rest; EOD
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+
+    g = request.args.get
+    days = int(g("days", 664)); src = g("src", "bees")
+    use_filter = g("use_filter", "1") == "1"
+    max_wait = int(g("max_wait", 60))
+    stop_pct = float(g("stop_pct", 0.128)) / 100.0
+    pn = int(g("pivot_n", 2)); need_hh = g("need_hh", "1") == "1"
+    multi = g("multi", "0") == "1"
+
+    if src == "bees":
+        try:
+            inst = kite.instruments("NSE")
+        except Exception as e:
+            return jsonify({"error": "instruments() failed: %s" % e}), 500
+        tok = next((r["instrument_token"] for r in inst
+                    if r.get("tradingsymbol") == "NIFTYBEES"
+                    and r.get("instrument_type") == "EQ"), None)
+        if not tok:
+            return jsonify({"error": "NIFTYBEES token not found"}), 500
+    else:
+        tok = NIFTY_TOKEN
+
+    c5 = _by_day(_pull(tok, days, "5minute"))
+    c3 = _by_day(_pull(tok, days, "3minute"))
+    if not c5 or not c3:
+        return jsonify({"error": "no candles", "src": src}), 500
+
+    def vwap(bars):
+        tot = sum((b.get("volume") or 0) for b in bars)
+        cp = cv = 0.0; out = []
+        for b in bars:
+            tp = (b["high"] + b["low"] + b["close"]) / 3.0
+            w = (b.get("volume") or 0) if tot > 0 else 1.0
+            cp += tp * w; cv += w
+            out.append(cp / cv if cv else tp)
+        return out, tot > 0
+
+    trades, vol_days = [], 0
+    filt_days = cross_days = trade_days = 0
+
+    for dk in sorted(c5.keys()):
+        if dk not in c3:
+            continue
+        b5, b3 = c5[dk], c3[dk]
+        if len(b5) < 20 or len(b3) < 30:
+            continue
+        cl5 = [b["close"] for b in b5]
+        cl3 = [b["close"] for b in b3]
+        e7_5, e9_5 = _ema(cl5, 7), _ema(cl5, 9)
+        e9_3 = _ema(cl3, 9)
+        vw5, hv = vwap(b5)
+        vw3, _ = vwap(b3)
+        if hv:
+            vol_days += 1
+
+        filt_t = None
+        if use_filter:
+            piv = []
+            for i in range(pn, len(b3) - pn):
+                h = b3[i]["high"]
+                if all(b3[j]["high"] < h for j in range(i - pn, i)) and \
+                   all(b3[j]["high"] < h for j in range(i + 1, i + pn + 1)):
+                    piv.append(i)
+            for pi in piv:
+                ci = pi + pn
+                if ci >= len(b3) - 2:
+                    continue
+                if need_hh:
+                    pr = [p for p in piv if p < pi]
+                    if not pr or b3[pi]["high"] <= b3[pr[-1]]["high"]:
+                        continue
+                if cl3[ci] <= e9_3[ci]:
+                    continue
+                if cl3[ci] >= vw3[ci]:
+                    continue
+                filt_t = b3[ci]["date"]; break
+            if filt_t is None:
+                continue
+            filt_days += 1
+
+        crosses = []
+        for j in range(1, len(b5) - 2):
+            if e9_5[j] > vw5[j] and e9_5[j - 1] <= vw5[j - 1]:
+                if filt_t is not None:
+                    dtm = (b5[j]["date"] - filt_t).total_seconds() / 60.0
+                    if dtm < 0 or dtm > max_wait:
+                        continue
+                crosses.append(j)
+                if not multi:
+                    break
+        if not crosses:
+            continue
+        cross_days += 1
+        took = False
+
+        for ci5 in crosses:
+            legs = [{"e": cl5[ci5], "leg": 1}]
+            added = False
+            took = True
+            for j in range(ci5 + 1, len(b5)):
+                if not legs:
+                    break
+                c = cl5[j]
+                for lg in list(legs):
+                    if (b5[j]["low"] - lg["e"]) / lg["e"] <= -stop_pct:
+                        trades.append({"date": dk, "leg": lg["leg"],
+                                       "bps": round(-stop_pct * 10000, 1),
+                                       "why": "stop_pct"})
+                        legs.remove(lg)
+                if not legs:
+                    break
+                if c < vw5[j]:
+                    for lg in legs:
+                        trades.append({"date": dk, "leg": lg["leg"],
+                                       "bps": round((c - lg["e"]) / lg["e"] * 10000, 1),
+                                       "why": "lost_vwap"})
+                    legs = []
+                    break
+                if not added and c > e7_5[j] and c > vw5[j]:
+                    legs.append({"e": c, "leg": 2}); added = True
+                    continue
+                if c < e9_5[j]:
+                    for lg in legs:
+                        trades.append({"date": dk, "leg": lg["leg"],
+                                       "bps": round((c - lg["e"]) / lg["e"] * 10000, 1),
+                                       "why": "ema9"})
+                    legs = []
+                    break
+                if c < e7_5[j] and len(legs) > 1:
+                    lg = legs.pop(0)
+                    trades.append({"date": dk, "leg": lg["leg"],
+                                   "bps": round((c - lg["e"]) / lg["e"] * 10000, 1),
+                                   "why": "ema7"})
+            for lg in legs:
+                trades.append({"date": dk, "leg": lg["leg"],
+                               "bps": round((cl5[-1] - lg["e"]) / lg["e"] * 10000, 1),
+                               "why": "eod"})
+        if took:
+            trade_days += 1
+
+    base = {"src": src, "sessions": len(c5),
+            "vwap_source": "volume" if vol_days else "twap_no_volume",
+            "filter_days": filt_days, "cross_days": cross_days,
+            "trade_days": trade_days,
+            "params": {"use_filter": use_filter, "max_wait_min": max_wait,
+                       "stop_pct": round(stop_pct * 100, 3), "pivot_n": pn,
+                       "need_hh": need_hh, "multi": multi}}
+
+    if not trades:
+        base["trades"] = 0
+        return jsonify(base), 200
+
+    p = sorted(t["bps"] for t in trades)
+    n = len(p)
+    w = [x for x in p if x > 0]; l = [x for x in p if x <= 0]
+    why = {}
+    for t in trades:
+        why[t["why"]] = why.get(t["why"], 0) + 1
+    l1 = [t["bps"] for t in trades if t["leg"] == 1]
+    l2 = [t["bps"] for t in trades if t["leg"] == 2]
+    NIF = 23500.0
+    mean = sum(p) / n
+    pr = (sum(w) / len(w)) / abs(sum(l) / len(l)) if w and l else None
+
+    base.update({
+        "trades": n, "win_rate_pct": round(len(w) / n * 100, 1),
+        "mean_bps": round(mean, 1), "median_bps": round(p[n // 2], 1),
+        "total_bps": round(sum(p), 1),
+        "mean_nifty_pts_equiv": round(mean / 10000 * NIF, 2),
+        "avg_win_bps": round(sum(w) / len(w), 1) if w else None,
+        "avg_loss_bps": round(sum(l) / len(l), 1) if l else None,
+        "payoff_ratio": round(pr, 2) if pr else None,
+        "breakeven_win_pct": round(100 / (1 + pr), 1) if pr else None,
+        "best_bps": p[-1], "worst_bps": p[0],
+        "leg1": {"n": len(l1), "mean_bps": round(sum(l1)/len(l1), 1)} if l1 else None,
+        "leg2": {"n": len(l2), "mean_bps": round(sum(l2)/len(l2), 1)} if l2 else None,
+        "exit_reasons": why,
+        "sample": trades[-10:],
+    })
+    return jsonify(base)
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
