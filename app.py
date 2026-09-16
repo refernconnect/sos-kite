@@ -3636,6 +3636,258 @@ def vrp_dump_route():
     })
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NIGHT FLY MANAGER — Telegram state machine for the overnight ATM iron fly.
+# Reads the broker (kite.positions) so nothing is ever ticked by hand.
+# PAPER PHASE: sends instructions only. Places NO orders.
+#
+# Env (all optional):
+#   NIGHTFLY_ENABLED   1
+#   NIGHTFLY_LOTS      1
+#   NIGHTFLY_WING      300
+#   NIGHTFLY_VIX_DAYS  120        rolling median window
+#   NIGHTFLY_SKIP      2026-10-01,2026-10-02,...   no-trade dates (event/holiday)
+#   NIGHTFLY_KILL_PTS  0          0 = auto (3 x 1% of credit, min 15 pts)
+#   NIGHTFLY_ENTRY     15:20      NIGHTFLY_EXIT 09:20
+# ═══════════════════════════════════════════════════════════════════════════
+NF = {
+    "enabled": os.environ.get("NIGHTFLY_ENABLED", "1") == "1",
+    "lots": int(os.environ.get("NIGHTFLY_LOTS", "1")),
+    "wing": int(os.environ.get("NIGHTFLY_WING", "300")),
+    "vix_days": int(os.environ.get("NIGHTFLY_VIX_DAYS", "120")),
+    "skip": {s.strip() for s in os.environ.get("NIGHTFLY_SKIP", "2026-10-01,2026-10-02,2026-10-20,2026-10-21,2026-10-29,2026-11-05").split(",") if s.strip()},
+    "kill_pts": float(os.environ.get("NIGHTFLY_KILL_PTS", "0")),
+    "entry": os.environ.get("NIGHTFLY_ENTRY", "15:20"),
+    "exit": os.environ.get("NIGHTFLY_EXIT", "09:20"),
+    "lot_size": 65,
+    "step": 50,
+}
+_NF = {"fired": {}, "day": None, "go": None, "reason": "", "legs": None, "credit": None,
+       "max_loss": None, "vix": None, "vix_med": None, "last_pos": None, "last_pnl": None,
+       "log": [], "err": None, "state": "boot"}
+
+
+def _nf_log(msg):
+    _NF["log"].append("%s %s" % (datetime.now(IST).strftime("%H:%M:%S"), msg))
+    _NF["log"] = _NF["log"][-60:]
+    print("[nightfly] " + msg)
+
+
+def _nf_once(key):
+    """True the first time `key` is seen today."""
+    d = datetime.now(IST).strftime("%Y-%m-%d")
+    if _NF["day"] != d:
+        _NF.update({"day": d, "fired": {}, "go": None, "legs": None, "credit": None, "max_loss": None})
+    if _NF["fired"].get(key):
+        return False
+    _NF["fired"][key] = True
+    return True
+
+
+def _nf_hhmm(s):
+    h, m = s.split(":")
+    return int(h) * 60 + int(m)
+
+
+def _nf_logged_in():
+    return bool(state.get("access_token")) and kite is not None
+
+
+def _nf_quote(keys):
+    return kite.quote(keys)
+
+
+def _nf_mid(q):
+    try:
+        b = q["depth"]["buy"][0]["price"]; a = q["depth"]["sell"][0]["price"]
+        if b > 0 and a > 0:
+            return (a + b) / 2.0
+    except Exception:
+        pass
+    return float(q.get("last_price") or 0)
+
+
+def _nf_vix():
+    """(vix_now, vix_median) using INDIA VIX daily closes."""
+    inst = kite.instruments("NSE")
+    tok = next((r["instrument_token"] for r in inst
+                if (r.get("tradingsymbol") or "").upper().replace(" ", "") == "INDIAVIX"), None)
+    q = _nf_quote(["NSE:INDIA VIX"])["NSE:INDIA VIX"]
+    now = float(q["last_price"])
+    med = None
+    if tok:
+        to_d = datetime.now(IST); fr = to_d - timedelta(days=int(NF["vix_days"] * 1.6))
+        bars = kite.historical_data(tok, fr.strftime("%Y-%m-%d"), to_d.strftime("%Y-%m-%d"), "day")
+        cl = sorted(b["close"] for b in bars[-NF["vix_days"]:])
+        if cl:
+            med = cl[len(cl) // 2]
+    return now, med
+
+
+def _nf_legs():
+    """Resolve the four tradingsymbols for tonight's fly + live credit."""
+    spot = float(_nf_quote(["NSE:NIFTY 50"])["NSE:NIFTY 50"]["last_price"])
+    K = int(round(spot / NF["step"]) * NF["step"])
+    up, dn = K + NF["wing"], K - NF["wing"]
+    nfo = kite.instruments("NFO")
+    today = datetime.now(IST).date()
+    opts = [x for x in nfo if x.get("name") == "NIFTY" and x.get("segment") == "NFO-OPT"]
+    def expd(x):
+        e = x.get("expiry")
+        return e.date() if hasattr(e, "hour") else e
+    exps = sorted({expd(x) for x in opts if expd(x) and expd(x) > today})
+    if not exps:
+        raise RuntimeError("no NIFTY expiries")
+    exp = exps[0]
+    def ts(strike, typ):
+        r = next((x for x in opts if expd(x) == exp and float(x["strike"]) == strike and x["instrument_type"] == typ), None)
+        if not r:
+            raise RuntimeError("no %s %s %s" % (exp, strike, typ))
+        return r["tradingsymbol"]
+    legs = [("SELL", ts(K, "CE")), ("SELL", ts(K, "PE")), ("BUY", ts(up, "CE")), ("BUY", ts(dn, "PE"))]
+    q = _nf_quote(["NFO:" + t for _, t in legs])
+    px = {t: _nf_mid(q["NFO:" + t]) for _, t in legs}
+    credit = px[legs[0][1]] + px[legs[1][1]] - px[legs[2][1]] - px[legs[3][1]]
+    return {"spot": spot, "K": K, "up": up, "dn": dn, "expiry": str(exp), "legs": legs, "px": px, "credit": credit,
+            "dte": (exp - today).days}
+
+
+def _nf_positions():
+    """Open NIFTY option positions: list of (tradingsymbol, qty, avg, pnl)."""
+    pos = kite.positions().get("net", [])
+    out = []
+    for p in pos:
+        if p.get("exchange") == "NFO" and (p.get("tradingsymbol") or "").startswith("NIFTY") and int(p.get("quantity") or 0) != 0:
+            out.append((p["tradingsymbol"], int(p["quantity"]), float(p.get("average_price") or 0), float(p.get("pnl") or 0)))
+    return out
+
+
+def _nf_fmt_legs(L):
+    lines = []
+    for side, t in L["legs"]:
+        lines.append("%s  <code>%s</code>  @ %.1f" % ("🔴 SELL" if side == "SELL" else "🟢 BUY ", t, L["px"][t]))
+    return "\n".join(lines)
+
+
+def _nf_kill_pts(credit):
+    if NF["kill_pts"] > 0:
+        return NF["kill_pts"]
+    return max(15.0, 3.0 * 0.01 * credit)
+
+
+def nightfly_loop():
+    _nf_log("manager up (paper mode, lots=%d wing=%d)" % (NF["lots"], NF["wing"]))
+    mult = NF["lot_size"] * NF["lots"]
+    while True:
+        try:
+            time.sleep(20)
+            now = datetime.now(IST)
+            hm = now.hour * 60 + now.minute
+            dow = now.weekday()                      # Mon=0 ... Sun=6
+            dstr = now.strftime("%Y-%m-%d")
+            if dow >= 5:
+                _NF["state"] = "weekend"
+                continue
+            entry_m, exit_m = _nf_hhmm(NF["entry"]), _nf_hhmm(NF["exit"])
+
+            # 09:00 — token nag
+            if 540 <= hm < 545 and not _nf_logged_in() and _nf_once("nag_login"):
+                tg_send("⚠️ <b>NIGHT FLY</b> — Kite not logged in. Needed for the 09:20 exit check and tonight's 15:20 call.\nLogin: /kite/login")
+
+            if not _nf_logged_in():
+                _NF["state"] = "no_token"
+                continue
+
+            # ── MORNING: exit + kill watch ─────────────────────────────
+            if exit_m - 5 <= hm <= exit_m + 12:
+                _NF["state"] = "exit_window"
+                pos = _nf_positions()
+                _NF["last_pos"] = pos
+                if pos:
+                    pnl = sum(p[3] for p in pos)
+                    _NF["last_pnl"] = pnl
+                    credit_guess = _NF.get("credit") or 200.0
+                    kill_rs = _nf_kill_pts(credit_guess) * mult
+                    if pnl < -kill_rs and _nf_once("kill"):
+                        tg_send("🚨 <b>NIGHT FLY — KILL. CLOSE NOW.</b>\nLive P&L ₹%s is past the kill line (₹-%s).\n%s"
+                                % (f"{pnl:,.0f}", f"{kill_rs:,.0f}", "\n".join("<code>%s</code> qty %d" % (p[0], p[1]) for p in pos)))
+                    if hm >= exit_m - 5 and _nf_once("exit_%d" % (hm // 3)):
+                        tg_send("◀️ <b>NIGHT FLY — EXIT NOW (09:20)</b>\nClose all legs. Live P&L: <b>₹%s</b>\n%s"
+                                % (f"{pnl:,.0f}", "\n".join("<code>%s</code> qty %d" % (p[0], p[1]) for p in pos)))
+                else:
+                    if _nf_once("flat_morning"):
+                        tg_send("✅ <b>NIGHT FLY</b> — flat at %s. Nothing to exit." % now.strftime("%H:%M"))
+                continue
+            if hm == exit_m + 13 and _nf_once("exit_final"):
+                pos = _nf_positions()
+                if pos:
+                    tg_send("❗ <b>NIGHT FLY — STILL OPEN after 09:30.</b> Close manually now.\n%s"
+                            % "\n".join("<code>%s</code> qty %d  P&L ₹%.0f" % (p[0], p[1], p[3]) for p in pos))
+                else:
+                    tg_send("✅ <b>NIGHT FLY</b> — closed. Log today's result.")
+
+            # ── 15:00 — decision ───────────────────────────────────────
+            if entry_m - 20 <= hm < entry_m and _nf_once("decide"):
+                _NF["state"] = "deciding"
+                vix, med = _nf_vix()
+                _NF["vix"], _NF["vix_med"] = vix, med
+                tmrw = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+                wd_ok = dow <= 3                                   # Mon–Thu
+                vix_ok = med is not None and vix < med
+                ev = dstr in NF["skip"] or tmrw in NF["skip"]
+                go = wd_ok and vix_ok and not ev
+                reason = "%s  ·  VIX %.2f %s med %s  ·  %s" % (
+                    "Mon–Thu ✓" if wd_ok else "Friday ✗",
+                    vix, "<" if vix_ok else "≥", ("%.2f" % med) if med else "?",
+                    "event ✗" if ev else "no event ✓")
+                _NF["go"], _NF["reason"] = go, reason
+                if go:
+                    tg_send("🟢 <b>NIGHT FLY — GO TONIGHT</b>\n%s\n\nLegs at 15:20. Nearest weekly, ATM fly, wings ±%d." % (reason, NF["wing"]))
+                else:
+                    tg_send("🔴 <b>NIGHT FLY — NO TRADE TONIGHT</b>\n%s" % reason)
+
+            # ── 15:20 — enter ──────────────────────────────────────────
+            if _NF.get("go") and entry_m <= hm <= entry_m + 2 and _nf_once("enter"):
+                _NF["state"] = "entering"
+                L = _nf_legs()
+                _NF["legs"], _NF["credit"] = L, L["credit"]
+                _NF["max_loss"] = (NF["wing"] - L["credit"]) * mult
+                tg_send("▶️ <b>NIGHT FLY — ENTER NOW</b>   (%s, %dd)\nSpot %.0f  ·  ATM <b>%d</b>  ·  wings %d / %d  ·  %d lot\n\n%s\n\n"
+                        "Credit <b>%.1f pts</b> (₹%s)\nMax loss <b>₹%s</b>  ·  max gain ₹%s\nFlat night ≈ +%.0f pts\n\n<i>Paper phase — place it, log it. I'll check in 6 min.</i>"
+                        % (L["expiry"], L["dte"], L["spot"], L["K"], L["up"], L["dn"], NF["lots"], _nf_fmt_legs(L),
+                           L["credit"], f"{L['credit']*mult:,.0f}", f"{_NF['max_loss']:,.0f}", f"{L['credit']*mult:,.0f}", 0.01 * L["credit"]))
+
+            # ── 15:26 / 15:30 — did you enter? ─────────────────────────
+            if _NF.get("go") and hm == entry_m + 6 and _nf_once("check1"):
+                pos = _nf_positions()
+                if pos:
+                    tg_send("✔️ <b>NIGHT FLY — position seen.</b> Hold overnight. I'll call the exit at 09:15.\n%s"
+                            % "\n".join("<code>%s</code> qty %d avg %.1f" % (p[0], p[1], p[2]) for p in pos))
+                else:
+                    tg_send("⏳ <b>NIGHT FLY — not entered yet.</b> 4 minutes left. If skipping tonight, ignore this.")
+            if _NF.get("go") and hm == entry_m + 10 and _nf_once("check2"):
+                pos = _nf_positions()
+                if pos:
+                    tg_send("🌙 <b>NIGHT FLY — holding.</b> Do nothing until 09:15. No rolling, no adding legs.")
+                else:
+                    tg_send("⛔ <b>NIGHT FLY — no position.</b> Tonight skipped. Next call tomorrow 15:00.")
+            _NF["state"] = "idle"
+        except Exception as e:
+            _NF["err"] = str(e)[:300]
+            _nf_log("error: %s" % e)
+            time.sleep(30)
+
+
+@app.route("/nightfly_status")
+def nightfly_status_route():
+    return jsonify({k: v for k, v in _NF.items() if k != "legs"} | {"legs": (_NF["legs"] or {}).get("legs"), "cfg": {k: (sorted(v) if isinstance(v, set) else v) for k, v in NF.items()}})
+
+
+if NF["enabled"] and kite is not None:
+    threading.Thread(target=nightfly_loop, name="nightfly", daemon=True).start()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
