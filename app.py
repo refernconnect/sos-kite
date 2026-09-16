@@ -2655,6 +2655,136 @@ def xs_status_route():
     })
     return jsonify(base)
 
+@app.route("/lhm")
+def lhm_route():
+    """Last-half-hour momentum (Baltussen et al. JFE 2021) on Nifty 5m.
+
+    ?days=900 &cut=15:00 &until=2026-08-02
+    r_rest = 09:15 open -> `cut` close.  r_last = `cut` close -> last bar close.
+    Strategy: at `cut`, take the sign of r_rest, exit at close.
+    Default `until` excludes post-CAS sessions (index behaviour changed 15:15+).
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+    g_ = request.args.get
+    days = int(g_("days", 900)); cut = g_("cut", "15:00"); until = g_("until", "2026-08-02")
+    ch, cm = [int(x) for x in cut.split(":")]
+
+    bd = _by_day(_pull(NIFTY_TOKEN, days, "5minute"))
+    rows = []
+    for dk in sorted(bd.keys()):
+        if dk > until:
+            continue
+        b = bd[dk]
+        if len(b) < 30:
+            continue
+        ci = None
+        for i, x in enumerate(b):
+            if x["date"].hour == ch and x["date"].minute == cm:
+                ci = i; break
+        if ci is None or ci >= len(b) - 1:
+            continue
+        o = b[0]["open"]; c_cut = b[ci]["close"]; c_end = b[-1]["close"]
+        r_rest = (c_cut / o - 1) * 10000
+        r_last = (c_end / c_cut - 1) * 10000
+        rows.append({"d": dk, "dow": b[0]["date"].weekday(),
+                     "r_rest": r_rest, "r_last": r_last,
+                     "strat": r_last if r_rest > 0 else (-r_last if r_rest < 0 else 0.0),
+                     "abs_rest": abs(r_rest)})
+    if len(rows) < 100:
+        return jsonify({"error": "too few sessions", "n": len(rows)}), 500
+
+    def st(sel, key="strat"):
+        if len(sel) < 20:
+            return None
+        v = [r[key] for r in sel]
+        m, t = _tstat(v)
+        w = sum(1 for x in v if x > 0)
+        return {"n": len(v), "mean_bps": round(m, 2), "t": round(t, 2),
+                "win_pct": round(w / len(v) * 100, 1),
+                "nifty_pts_equiv": round(m / 10000 * 23500, 2)}
+
+    def corr(sel):
+        x = [r["r_rest"] for r in sel]; y = [r["r_last"] for r in sel]
+        n = len(x); mx = sum(x) / n; my = sum(y) / n
+        cov = sum((a - mx) * (b_ - my) for a, b_ in zip(x, y))
+        vx = sum((a - mx) ** 2 for a in x) ** 0.5
+        vy = sum((b_ - my) ** 2 for b_ in y) ** 0.5
+        return round(cov / (vx * vy), 4) if vx and vy else None
+
+    dks = [r["d"] for r in rows]
+    i1, i2 = int(len(dks) * 0.5), int(len(dks) * 0.75)
+    tr, va, ho = rows[:i1], rows[i1:i2], rows[i2:]
+    ab = sorted(r["abs_rest"] for r in rows)
+    t1, t2 = ab[len(ab) // 3], ab[2 * len(ab) // 3]
+    sign_agree = sum(1 for r in rows if r["r_rest"] * r["r_last"] > 0)
+    nz = sum(1 for r in rows if r["r_rest"] * r["r_last"] != 0)
+
+    return jsonify({
+        "sessions": len(rows), "cut": cut, "until": until,
+        "correlation_rest_vs_last": corr(rows),
+        "sign_agreement_pct": round(sign_agree / nz * 100, 1) if nz else None,
+        "strategy_all": st(rows),
+        "strategy_train": st(tr), "strategy_val": st(va),
+        "strategy_holdout_SEALED": {"n": len(ho)},
+        "by_abs_rest_tercile": {
+            "small_moves": st([r for r in rows if r["abs_rest"] <= t1]),
+            "mid_moves": st([r for r in rows if t1 < r["abs_rest"] <= t2]),
+            "big_moves": st([r for r in rows if r["abs_rest"] > t2]),
+            "tercile_cuts_bps": [round(t1, 1), round(t2, 1)]},
+        "by_weekday": {["Mon", "Tue", "Wed", "Thu", "Fri"][k]:
+                       st([r for r in rows if r["dow"] == k]) for k in range(5)},
+        "unconditional_last_half_hour": st(rows, "r_last"),
+    })
+
+
+@app.route("/ovn")
+def ovn_route():
+    """Overnight vs intraday decomposition on Nifty daily bars. ?days=2000"""
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+    days = int(request.args.get("days", 2000))
+    to_d = datetime.now(IST); fr = to_d - timedelta(days=days)
+    try:
+        bars = kite.historical_data(NIFTY_TOKEN, fr.strftime("%Y-%m-%d"),
+                                    to_d.strftime("%Y-%m-%d"), "day")
+    except Exception as e:
+        return jsonify({"error": "historical: %s" % e}), 500
+    if len(bars) < 200:
+        return jsonify({"error": "too few days", "n": len(bars)}), 500
+
+    rows = []
+    for i in range(1, len(bars)):
+        p, b = bars[i - 1], bars[i]
+        rows.append({"y": b["date"].year, "dow": b["date"].weekday(),
+                     "ovn": (b["open"] / p["close"] - 1) * 10000,
+                     "intra": (b["close"] / b["open"] - 1) * 10000,
+                     "prev_intra": (p["close"] / p["open"] - 1) * 10000})
+
+    def st(sel, key):
+        if len(sel) < 20:
+            return None
+        v = [r[key] for r in sel]
+        m, t = _tstat(v)
+        return {"n": len(v), "mean_bps": round(m, 2), "t": round(t, 2),
+                "win_pct": round(sum(1 for x in v if x > 0) / len(v) * 100, 1),
+                "annualised_pct": round(m / 10000 * 250 * 100, 1)}
+
+    yrs = sorted(set(r["y"] for r in rows))
+    return jsonify({
+        "sessions": len(rows), "from": str(bars[0]["date"].date()),
+        "overnight_all": st(rows, "ovn"), "intraday_all": st(rows, "intra"),
+        "by_year": {str(y): {"overnight": st([r for r in rows if r["y"] == y], "ovn"),
+                             "intraday": st([r for r in rows if r["y"] == y], "intra")}
+                    for y in yrs},
+        "overnight_by_weekday": {["Mon", "Tue", "Wed", "Thu", "Fri"][k]:
+                                 st([r for r in rows if r["dow"] == k], "ovn")
+                                 for k in range(5)},
+        "tug_of_war": {
+            "overnight_after_UP_intraday": st([r for r in rows if r["prev_intra"] > 0], "ovn"),
+            "overnight_after_DOWN_intraday": st([r for r in rows if r["prev_intra"] < 0], "ovn")},
+    })
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
