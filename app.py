@@ -2488,12 +2488,18 @@ _XS = {"state": "idle", "done": 0, "total": 0, "err": None, "rows": [], "started
 
 @app.route("/xs_start")
 def xs_start_route():
-    """Cross-sectional opening-participation ORB across CAS-eligible F&O stocks.
+    """Cross-sectional opening-participation ORB across F&O-eligible stocks.
 
     ?days=400&limit=210&lookback=14
     ORV = first 5m volume / mean first 5m volume of prior `lookback` sessions.
     Each day: rank stocks by ORV. Direction from first 5m candle. Enter 09:20,
     stop at opposite end of the opening range, exit at close. Returns in bps and R.
+
+    Universe = F&O-eligible stock underlyings, built from Kite's own NFO
+    instrument dump intersected with NSE EQ tradingsymbols (static, always
+    available). Previously this scraped NSE's live CAS endpoint, which only
+    has data during/after that day's 15:00-15:40 IST auction and threw
+    "empty universe" at any other time of day -- that dependency is gone.
     """
     if not state.get("access_token"):
         return jsonify({"error": "not logged in - do the Kite login first"}), 400
@@ -2509,27 +2515,23 @@ def xs_start_route():
         try:
             _XS.update({"state": "running", "done": 0, "total": 0,
                         "err": None, "rows": [], "started": datetime.now(IST).isoformat()})
-            s = requests.Session()
-            s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                            "Chrome/124.0.0.0 Safari/537.36",
-                              "Accept": "*/*", "Accept-Encoding": "gzip, deflate"})
-            s.get("https://www.nseindia.com", timeout=12)
-            s.get("https://www.nseindia.com/market-data/closing-auction-session", timeout=12)
-            r = s.get("https://www.nseindia.com/api/NextApi/apiClient/casApi"
-                      "?functionName=getCASData",
-                      headers={"Referer": "https://www.nseindia.com/market-data/"
-                                          "closing-auction-session",
-                               "X-Requested-With": "XMLHttpRequest"}, timeout=15)
-            d = r.json().get("data") or []
-            d.sort(key=lambda x: x.get("finalValue") or 0, reverse=True)
-            uni = [x["symbol"] for x in d if x.get("symbol")][:limit]
-            if not uni:
-                raise ValueError("empty universe")
 
             nse = kite.instruments("NSE")
             tk = {x["tradingsymbol"]: x["instrument_token"] for x in nse
                   if x.get("segment") == "NSE" and x.get("instrument_type") == "EQ"}
+
+            nfo = kite.instruments("NFO")
+            liq = {}
+            for x in nfo:
+                nm = x.get("name")
+                if not nm or nm not in tk:
+                    continue
+                if x.get("segment") not in ("NFO-OPT", "NFO-FUT"):
+                    continue
+                liq[nm] = liq.get(nm, 0) + 1
+            uni = [nm for nm, _ in sorted(liq.items(), key=lambda kv: kv[1], reverse=True)][:limit]
+            if not uni:
+                raise ValueError("empty universe")
             _XS["total"] = len(uni)
 
             for sym in uni:
@@ -2784,6 +2786,112 @@ def ovn_route():
             "overnight_after_UP_intraday": st([r for r in rows if r["prev_intra"] > 0], "ovn"),
             "overnight_after_DOWN_intraday": st([r for r in rows if r["prev_intra"] < 0], "ovn")},
     })
+
+def bar_at(day_bars, hhmm):
+    """First bar in a day's list stamped exactly at clock time hhmm ('HH:MM')."""
+    for c in day_bars:
+        if c["date"].strftime("%H:%M") == hhmm:
+            return c
+    return None
+
+
+@app.route("/ovn2")
+def ovn2_route():
+    """Overnight hold at REALISTIC timestamps, not spot daily close/open.
+
+    Buy at `entry` clock time on day i, sell at `exit` clock time on day i+1.
+    Default instrument is NIFTYBEES (a real traded ETF, not CAS-eligible --
+    CAS only applies to F&O stocks -- so unaffected by the Aug-2026 auction
+    change). Direction condition (`own_dir_bps`) is day i's 09:15-open to
+    entry-time price: knowable at the moment the trade would actually be
+    placed, so it can't leak information from later in the session.
+
+    ?days=900 &src=bees|index &entry=15:20 &exit=09:20 &cost_bps=4
+    Always returns all/after-UP-day/after-DOWN-day splits together.
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+
+    g = request.args.get
+    days = int(g("days", 900))
+    src = g("src", "bees")
+    entry_hhmm = g("entry", "15:20")
+    exit_hhmm = g("exit", "09:20")
+    cost_bps = float(g("cost_bps", 4))
+
+    if src == "bees":
+        try:
+            inst = kite.instruments("NSE")
+        except Exception as e:
+            return jsonify({"error": "instruments() failed: %s" % e}), 500
+        tok = next((r["instrument_token"] for r in inst
+                    if r.get("tradingsymbol") == "NIFTYBEES"
+                    and r.get("instrument_type") == "EQ"), None)
+        if not tok:
+            return jsonify({"error": "NIFTYBEES token not found"}), 500
+    else:
+        tok = NIFTY_TOKEN
+
+    bars = _pull(tok, days, "5minute")
+    if len(bars) < 500:
+        return jsonify({"error": "too few bars", "n": len(bars)}), 500
+    bd = _by_day(bars)
+    dks = sorted(bd.keys())
+
+    rows = []
+    for i in range(len(dks) - 1):
+        today, tomorrow = bd[dks[i]], bd[dks[i + 1]]
+        o = today[0]
+        e = bar_at(today, entry_hhmm)
+        x = bar_at(tomorrow, exit_hhmm)
+        if not (o and e and x):
+            continue
+        own_dir_bps = (e["open"] / o["open"] - 1) * 10000
+        gross_bps = (x["open"] / e["open"] - 1) * 10000
+        rows.append({
+            "d": dks[i], "y": today[0]["date"].year,
+            "dow": today[0]["date"].weekday(),
+            "own_dir_bps": own_dir_bps,
+            "gross_bps": gross_bps,
+            "net_bps": gross_bps - cost_bps,
+        })
+
+    def st(sel, key):
+        if len(sel) < 20:
+            return None
+        v = [r[key] for r in sel]
+        m, t = _tstat(v)
+        return {"n": len(v), "mean_bps": round(m, 2), "t": round(t, 2),
+                "win_pct": round(sum(1 for r in sel if r[key] > 0) / len(sel) * 100, 1),
+                "annualised_pct": round(m / 10000 * 250 * 100, 1)}
+
+    if not rows:
+        return jsonify({"error": "no overlapping entry/exit bars found",
+                        "sessions_seen": len(dks)}), 500
+
+    yrs = sorted(set(r["y"] for r in rows))
+    up = [r for r in rows if r["own_dir_bps"] > 0]
+    down = [r for r in rows if r["own_dir_bps"] < 0]
+
+    return jsonify({
+        "instrument": "NIFTYBEES" if src == "bees" else "NIFTY_INDEX",
+        "entry_time": entry_hhmm, "exit_time": exit_hhmm,
+        "cost_bps": cost_bps, "sessions": len(rows),
+        "from": dks[0], "to": dks[-1],
+        "all_gross": st(rows, "gross_bps"),
+        "all_net": st(rows, "net_bps"),
+        "after_UP_day_gross": st(up, "gross_bps"),
+        "after_UP_day_net": st(up, "net_bps"),
+        "after_DOWN_day_gross": st(down, "gross_bps"),
+        "after_DOWN_day_net": st(down, "net_bps"),
+        "by_year": {str(y): {"gross": st([r for r in rows if r["y"] == y], "gross_bps"),
+                             "net": st([r for r in rows if r["y"] == y], "net_bps")}
+                    for y in yrs},
+        "by_weekday": {["Mon", "Tue", "Wed", "Thu", "Fri"][k]:
+                       st([r for r in rows if r["dow"] == k], "gross_bps")
+                       for k in range(5)},
+    })
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
