@@ -2483,7 +2483,7 @@ def scan2_route():
         "survivors": len(out), "top": out[:20],
     })
 
-_XS = {"state": "idle", "done": 0, "total": 0, "err": None, "rows": [], "started": None}
+_XS = {"state": "idle", "done": 0, "total": 0, "err": None, "rows": [], "started": None, "mkt": {}}
 
 
 @app.route("/xs_start")
@@ -2514,7 +2514,8 @@ def xs_start_route():
     def job():
         try:
             _XS.update({"state": "running", "done": 0, "total": 0,
-                        "err": None, "rows": [], "started": datetime.now(IST).isoformat()})
+                        "err": None, "rows": [], "mkt": {},
+                        "started": datetime.now(IST).isoformat()})
 
             nse = kite.instruments("NSE")
             tk = {x["tradingsymbol"]: x["instrument_token"] for x in nse
@@ -2555,6 +2556,11 @@ def xs_start_route():
                     v0 = f.get("volume") or 0
                     if v0 <= 0:
                         continue
+                    mk = _XS["mkt"].setdefault(dk, {"vol": 0.0, "n": 0, "up": 0})
+                    mk["vol"] += v0
+                    mk["n"] += 1
+                    if f["close"] > f["open"]:
+                        mk["up"] += 1
                     if len(hist) >= lookback:
                         avg = sum(hist[-lookback:]) / lookback
                         orv = v0 / avg if avg else None
@@ -2588,6 +2594,12 @@ def xs_start_route():
                         "bps": round(pnl / ent * 10000, 1),
                         "r": round(pnl / risk, 3), "why": why})
                 _XS["done"] += 1
+            try:
+                with open("/tmp/xs_rows.json", "w") as fh:
+                    json.dump({"rows": _XS["rows"], "mkt": _XS["mkt"],
+                               "started": _XS["started"]}, fh)
+            except Exception:
+                pass
             _XS["state"] = "done"
         except Exception as e:
             _XS["err"] = str(e)[:300]
@@ -2891,6 +2903,335 @@ def ovn2_route():
                        st([r for r in rows if r["dow"] == k], "gross_bps")
                        for k in range(5)},
     })
+
+
+
+# ─── RESEARCH STATS LAYER (server-side; sandbox cannot pull bulk data) ───────
+
+def _dist(vals, boot=1000, seed=7):
+    """Full distribution summary in pure Python. vals: list of floats."""
+    import random, math
+    n = len(vals)
+    if n < 20:
+        return None
+    s = sorted(vals)
+    m = sum(s) / n
+    var = sum((x - m) ** 2 for x in s) / (n - 1)
+    sd = math.sqrt(var) if var > 0 else 0.0
+    t = m / (sd / math.sqrt(n)) if sd > 0 else 0.0
+    rng = random.Random(seed)
+    bm = []
+    for _ in range(boot):
+        acc = 0.0
+        for _ in range(n):
+            acc += s[rng.randrange(n)]
+        bm.append(acc / n)
+    bm.sort()
+    k1 = max(1, int(math.ceil(n * 0.01)))
+    ex1 = s[:-k1]
+    ex10 = s[:-10] if n > 30 else s
+    tot = sum(s)
+    top10 = sum(s[-10:])
+    pos = sum(x for x in s if x > 0)
+    return {
+        "n": n, "mean": round(m, 2), "sd": round(sd, 1), "t": round(t, 2),
+        "ci95": [round(bm[int(boot * 0.025)], 2), round(bm[int(boot * 0.975)], 2)],
+        "median": round(s[n // 2], 2),
+        "win_pct": round(sum(1 for x in s if x > 0) / n * 100, 1),
+        "p5": round(s[int(n * 0.05)], 1), "p95": round(s[int(n * 0.95)], 1),
+        "mean_ex_top1pct": round(sum(ex1) / len(ex1), 2),
+        "mean_ex_top10": round(sum(ex10) / len(ex10), 2),
+        "top10_share_of_total": round(top10 / tot, 2) if tot > 0 else None,
+        "top10_share_of_gross_wins": round(top10 / pos, 2) if pos > 0 else None,
+    }
+
+
+def _xs_ranked():
+    """Rows with per-day ORV rank + time splits. Falls back to /tmp snapshot."""
+    rows, mkt = _XS["rows"], _XS.get("mkt") or {}
+    if not rows:
+        try:
+            with open("/tmp/xs_rows.json") as fh:
+                snap = json.load(fh)
+            rows, mkt = snap.get("rows", []), snap.get("mkt", {})
+        except Exception:
+            return None
+    if not rows:
+        return None
+    byday = {}
+    for r in rows:
+        byday.setdefault(r["d"], []).append(r)
+    ranked = []
+    for dk, rs in byday.items():
+        rs.sort(key=lambda x: -x["orv"])
+        for i, r in enumerate(rs):
+            r["rank"] = i + 1
+            ranked.append(r)
+    dks = sorted(byday.keys())
+    i1, i2 = int(len(dks) * 0.5), int(len(dks) * 0.75)
+    return {"ranked": ranked, "dks": dks, "mkt": mkt,
+            "tr": set(dks[:i1]), "va": set(dks[i1:i2]), "ho": set(dks[i2:])}
+
+
+_XS_BUCKETS = ((1, 5, "rank_1_5"), (6, 10, "rank_6_10"), (11, 20, "rank_11_20"),
+               (21, 50, "rank_21_50"), (51, 9999, "rank_51_plus"))
+
+
+@app.route("/xs_stats")
+def xs_stats_route():
+    """Proper statistics on the cross-sectional scan. ?unseal=0&cost_bps=8
+    dev = train+val pooled. Holdout reported only with unseal=1."""
+    R = _xs_ranked()
+    if not R:
+        return jsonify({"error": "no xs rows in memory or snapshot - run /xs_start"}), 400
+    ranked, tr, va, ho = R["ranked"], R["tr"], R["va"], R["ho"]
+    unseal = request.args.get("unseal", "0") == "1"
+    cost = float(request.args.get("cost_bps", 8))
+
+    def pack(sel):
+        if len(sel) < 20:
+            return None
+        d_bps = _dist([x["bps"] for x in sel])
+        d_r = _dist([x["r"] for x in sel])
+        if d_bps:
+            d_bps["net_mean_at_cost"] = round(d_bps["mean"] - cost, 2)
+        return {"bps": d_bps, "R": d_r,
+                "stop_pct": round(sum(1 for x in sel if x["why"] == "stop") / len(sel) * 100, 1),
+                "long_pct": round(sum(1 for x in sel if x["dir"] == 1) / len(sel) * 100, 1)}
+
+    out = {"sessions": len(R["dks"]), "cost_bps_floor": cost,
+           "split_days": {"train": len(tr), "val": len(va), "holdout": len(ho)},
+           "buckets": {}}
+    for lo_, hi_, lbl in _XS_BUCKETS:
+        sel = [r for r in ranked if lo_ <= r["rank"] <= hi_]
+        dev = [r for r in sel if r["d"] in tr or r["d"] in va]
+        out["buckets"][lbl] = {
+            "train": pack([r for r in sel if r["d"] in tr]),
+            "val": pack([r for r in sel if r["d"] in va]),
+            "dev": pack(dev),
+            "holdout": pack([r for r in sel if r["d"] in ho]) if unseal else "SEALED",
+        }
+    top = [r for r in ranked if r["rank"] <= 5 and (r["d"] in tr or r["d"] in va)]
+    yrs = sorted(set(r["d"][:4] for r in top))
+    out["rank_1_5_dev_breakdown"] = {
+        "by_year": {y: pack([r for r in top if r["d"][:4] == y]) for y in yrs},
+        "long_only": pack([r for r in top if r["dir"] == 1]),
+        "short_only": pack([r for r in top if r["dir"] == -1]),
+        "rank_1_only": pack([r for r in ranked if r["rank"] == 1 and (r["d"] in tr or r["d"] in va)]),
+        "rank_2_3": pack([r for r in ranked if 2 <= r["rank"] <= 3 and (r["d"] in tr or r["d"] in va)]),
+        "rank_4_5": pack([r for r in ranked if 4 <= r["rank"] <= 5 and (r["d"] in tr or r["d"] in va)]),
+        "orv_ge_3": pack([r for r in top if r["orv"] >= 3.0]),
+        "orv_lt_3": pack([r for r in top if r["orv"] < 3.0]),
+    }
+    out["unfiltered_dev"] = pack([r for r in ranked if r["d"] in tr or r["d"] in va])
+    return jsonify(out)
+
+
+@app.route("/xs_dump")
+def xs_dump_route():
+    """Raw rows for one bucket. ?bucket=rank_1_5&split=dev|train|val|holdout"""
+    R = _xs_ranked()
+    if not R:
+        return jsonify({"error": "no xs rows"}), 400
+    bucket = request.args.get("bucket", "rank_1_5")
+    split = request.args.get("split", "dev")
+    lohi = {lbl: (lo_, hi_) for lo_, hi_, lbl in _XS_BUCKETS}.get(bucket)
+    if not lohi:
+        return jsonify({"error": "bad bucket"}), 400
+    days = {"train": R["tr"], "val": R["va"], "holdout": R["ho"],
+            "dev": R["tr"] | R["va"]}.get(split)
+    if days is None:
+        return jsonify({"error": "bad split"}), 400
+    sel = [r for r in R["ranked"] if lohi[0] <= r["rank"] <= lohi[1] and r["d"] in days]
+    sel.sort(key=lambda x: (x["d"], x["rank"]))
+    return jsonify({"bucket": bucket, "split": split, "n": len(sel),
+                    "cols": ["d", "s", "rank", "orv", "dir", "bps", "r", "why"],
+                    "rows": [[r["d"], r["s"], r["rank"], r["orv"], r["dir"], r["bps"], r["r"], r["why"]]
+                             for r in sel]})
+
+
+@app.route("/nifty_orb")
+def nifty_orb_route():
+    """Index ORB gated by MARKET-WIDE opening participation.
+    Participation = mean first-5m volume across all F&O stocks today vs its
+    trailing-14-session mean (from the /xs_start run; no extra Kite calls).
+    Prices are the NIFTY index (no ETF print artefacts); execution would be
+    futures, budget ~2bps on top. ?days=400&lookback=14&unseal=0
+    Expiry weekday: Thu before 2025-09-01, Tue from then (?switch=YYYY-MM-DD)."""
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+    R = _xs_ranked()
+    if not R or not R["mkt"]:
+        return jsonify({"error": "market participation series missing - run /xs_start first"}), 400
+    g = request.args.get
+    days = int(g("days", 400)); lookback = int(g("lookback", 14))
+    unseal = g("unseal", "0") == "1"
+    switch = g("switch", "2025-09-01")
+
+    mkt = R["mkt"]
+    mdays = sorted(mkt.keys())
+    per = {dk: (mkt[dk]["vol"] / mkt[dk]["n"]) for dk in mdays if mkt[dk]["n"] > 0}
+    orv, breadth = {}, {}
+    hist = []
+    for dk in mdays:
+        if dk not in per:
+            continue
+        if len(hist) >= lookback:
+            avg = sum(hist[-lookback:]) / lookback
+            if avg > 0:
+                orv[dk] = per[dk] / avg
+        hist.append(per[dk])
+        breadth[dk] = mkt[dk]["up"] / mkt[dk]["n"]
+
+    bd = _by_day(_pull(NIFTY_TOKEN, days, "5minute"))
+    rows = []
+    for dk in sorted(bd.keys()):
+        b = bd[dk]
+        if len(b) < 20 or dk not in orv:
+            continue
+        f = b[0]
+        if f["close"] == f["open"]:
+            continue
+        long_ = f["close"] > f["open"]
+        hi, lo = f["high"], f["low"]
+        ent = b[1]["open"]
+        stop = lo if long_ else hi
+        risk = abs(ent - stop)
+        if risk <= 0:
+            continue
+        ex, why = b[-1]["close"], "eod"
+        for x in b[1:]:
+            if long_ and x["low"] <= stop:
+                ex, why = stop, "stop"; break
+            if (not long_) and x["high"] >= stop:
+                ex, why = stop, "stop"; break
+        pnl = (ex - ent) if long_ else (ent - ex)
+        wd = f["date"].weekday()
+        exp_wd = 3 if dk < switch else 1
+        br = breadth.get(dk, 0.5)
+        rows.append({"d": dk, "orv": orv[dk], "dir": 1 if long_ else -1,
+                     "bps": pnl / ent * 10000, "r": pnl / risk, "why": why,
+                     "expiry": wd == exp_wd,
+                     "agree": (long_ and br > 0.6) or ((not long_) and br < 0.4),
+                     "range_bps": (hi - lo) / ent * 10000})
+    if len(rows) < 60:
+        return jsonify({"error": "too few index sessions", "n": len(rows)}), 500
+
+    dks = sorted(r["d"] for r in rows)
+    i1, i2 = int(len(dks) * 0.5), int(len(dks) * 0.75)
+    tr, va, ho = set(dks[:i1]), set(dks[i1:i2]), set(dks[i2:])
+
+    def pack(sel):
+        if len(sel) < 20:
+            return None
+        return {"bps": _dist([x["bps"] for x in sel]), "R": _dist([x["r"] for x in sel]),
+                "stop_pct": round(sum(1 for x in sel if x["why"] == "stop") / len(sel) * 100, 1)}
+
+    def splits(sel):
+        return {"train": pack([r for r in sel if r["d"] in tr]),
+                "val": pack([r for r in sel if r["d"] in va]),
+                "dev": pack([r for r in sel if r["d"] in tr or r["d"] in va]),
+                "holdout": pack([r for r in sel if r["d"] in ho]) if unseal else "SEALED"}
+
+    bands = ((0, 0.7, "orv_lt_0.7"), (0.7, 1.0, "orv_0.7_1.0"), (1.0, 1.3, "orv_1.0_1.3"),
+             (1.3, 1.8, "orv_1.3_1.8"), (1.8, 2.5, "orv_1.8_2.5"), (2.5, 99, "orv_ge_2.5"))
+    dev = [r for r in rows if r["d"] in tr or r["d"] in va]
+    return jsonify({
+        "sessions": len(rows), "from": dks[0], "to": dks[-1],
+        "split_days": {"train": len(tr), "val": len(va), "holdout": len(ho)},
+        "note": "index prices; add ~2bps for futures execution",
+        "unfiltered": splits(rows),
+        "by_participation_band": {lbl: splits([r for r in rows if lo_ <= r["orv"] < hi_])
+                                  for lo_, hi_, lbl in bands},
+        "dev_breadth_agree": pack([r for r in dev if r["agree"]]),
+        "dev_breadth_disagree": pack([r for r in dev if not r["agree"]]),
+        "dev_expiry_day": pack([r for r in dev if r["expiry"]]),
+        "dev_non_expiry": pack([r for r in dev if not r["expiry"]]),
+        "dev_high_part_and_agree": pack([r for r in dev if r["orv"] >= 1.3 and r["agree"]]),
+        "dev_long_only": pack([r for r in dev if r["dir"] == 1]),
+        "dev_short_only": pack([r for r in dev if r["dir"] == -1]),
+    })
+
+
+@app.route("/ovn3")
+def ovn3_route():
+    """Does a NIFTY FUTURES overnight hold capture what the index shows?
+    Same nights, 15:20 -> next 09:20, futures vs index. Only currently-listed
+    contracts have history on Kite, so this measures execution fidelity and
+    carry over ~2-3 months, not the edge itself. ?days=120&entry=15:20&exit=09:20"""
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+    g = request.args.get
+    days = int(g("days", 120)); entry_hhmm = g("entry", "15:20"); exit_hhmm = g("exit", "09:20")
+    try:
+        nfo = kite.instruments("NFO")
+    except Exception as e:
+        return jsonify({"error": "instruments: %s" % e}), 500
+    today = datetime.now(IST).date()
+
+    def expd(x):
+        e = x.get("expiry")
+        if hasattr(e, "year"):
+            return e if not hasattr(e, "hour") else e.date()
+        try:
+            return datetime.strptime(str(e)[:10], "%Y-%m-%d").date()
+        except Exception:
+            return None
+    futs = [(expd(x), x) for x in nfo
+            if x.get("name") == "NIFTY" and x.get("segment") == "NFO-FUT"]
+    futs = sorted([(e, x) for e, x in futs if e and e >= today], key=lambda t: t[0])[:2]
+    if not futs:
+        return jsonify({"error": "no NIFTY futures found"}), 500
+
+    idx = _by_day(_pull(NIFTY_TOKEN, days, "5minute"))
+    idks = sorted(idx.keys())
+    nxt = {idks[i]: idks[i + 1] for i in range(len(idks) - 1)}
+
+    def per_contract(e, x):
+        fb = _by_day(_pull(x["instrument_token"], days, "5minute"))
+        fut_v, idx_v, gap_v, basis_v, dbasis_v = [], [], [], [], []
+        up_f, up_i, dn_f, dn_i = [], [], [], []
+        for dk in sorted(fb.keys()):
+            nd = nxt.get(dk)
+            if not nd or nd not in fb or dk not in idx:
+                continue
+            fe, fx = bar_at(fb[dk], entry_hhmm), bar_at(fb[nd], exit_hhmm)
+            ie, ix = bar_at(idx[dk], entry_hhmm), bar_at(idx[nd], exit_hhmm)
+            io = idx[dk][0]
+            if not (fe and fx and ie and ix) or (fe.get("volume") or 0) == 0:
+                continue
+            f_bps = (fx["open"] / fe["open"] - 1) * 10000
+            i_bps = (ix["open"] / ie["open"] - 1) * 10000
+            b0 = (fe["open"] / ie["open"] - 1) * 10000
+            b1 = (fx["open"] / ix["open"] - 1) * 10000
+            fut_v.append(f_bps); idx_v.append(i_bps); gap_v.append(f_bps - i_bps)
+            basis_v.append(b0); dbasis_v.append(b1 - b0)
+            if ie["open"] > io["open"]:
+                up_f.append(f_bps); up_i.append(i_bps)
+            elif ie["open"] < io["open"]:
+                dn_f.append(f_bps); dn_i.append(i_bps)
+        n = len(fut_v)
+        if n < 10:
+            return {"contract": x["tradingsymbol"], "expiry": str(e), "nights": n,
+                    "note": "too few nights with a traded 15:20 bar"}
+        mf, mi = sum(fut_v) / n, sum(idx_v) / n
+        sf = (sum((a - mf) ** 2 for a in fut_v) / max(n - 1, 1)) ** 0.5
+        si = (sum((a - mi) ** 2 for a in idx_v) / max(n - 1, 1)) ** 0.5
+        cov = sum((a - mf) * (b - mi) for a, b in zip(fut_v, idx_v)) / max(n - 1, 1)
+        corr = cov / (sf * si) if sf > 0 and si > 0 else None
+        def mean(v): return round(sum(v) / len(v), 2) if v else None
+        return {"contract": x["tradingsymbol"], "expiry": str(e), "nights": n,
+                "futures_overnight_bps": _dist(fut_v) if n >= 20 else {"mean": mean(fut_v), "n": n},
+                "index_overnight_bps": _dist(idx_v) if n >= 20 else {"mean": mean(idx_v), "n": n},
+                "gap_fut_minus_idx_bps": _dist(gap_v) if n >= 20 else {"mean": mean(gap_v), "n": n},
+                "corr_fut_idx": round(corr, 3) if corr is not None else None,
+                "basis_at_entry_bps_mean": mean(basis_v),
+                "basis_change_overnight_bps_mean": mean(dbasis_v),
+                "after_UP_day": {"n": len(up_f), "fut_mean": mean(up_f), "idx_mean": mean(up_i)},
+                "after_DOWN_day": {"n": len(dn_f), "fut_mean": mean(dn_f), "idx_mean": mean(dn_i)}}
+
+    return jsonify({"entry": entry_hhmm, "exit": exit_hhmm, "days_requested": days,
+                    "contracts": [per_contract(e, x) for e, x in futs]})
 
 
 if __name__ == "__main__":
