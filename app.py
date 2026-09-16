@@ -2343,6 +2343,146 @@ def scan_route():
         "top": results[:25],
     })
 
+@app.route("/scan2")
+def scan2_route():
+    """Corrected scan: non-overlapping windows, bar-of-day demeaned, fixed horizon.
+
+    ?days=900 &src=bees|index &fwd=6 &q=5 &min_t=2.0 &demean=bod|none
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+    g_ = request.args.get
+    days = int(g_("days", 900)); src = g_("src", "bees")
+    fwd = int(g_("fwd", 6)); nq = int(g_("q", 5))
+    min_t = float(g_("min_t", 2.0)); demean = g_("demean", "bod")
+
+    if src == "bees":
+        try:
+            inst = kite.instruments("NSE")
+        except Exception as e:
+            return jsonify({"error": "instruments(): %s" % e}), 500
+        tok = next((r["instrument_token"] for r in inst
+                    if r.get("tradingsymbol") == "NIFTYBEES"
+                    and r.get("instrument_type") == "EQ"), None)
+        if not tok:
+            return jsonify({"error": "NIFTYBEES token not found"}), 500
+    else:
+        tok = NIFTY_TOKEN
+
+    byday = _by_day(_pull(tok, days, "5minute"))
+    dks = sorted(byday.keys())
+    if len(dks) < 60:
+        return jsonify({"error": "insufficient history"}), 500
+
+    rows = []; prev_close = None; or_hist = []
+    for dk in dks:
+        bars = byday[dk]
+        if len(bars) < 30:
+            continue
+        o = bars[0]["open"]
+        cl = [b["close"] for b in bars]; hi = [b["high"] for b in bars]
+        lo = [b["low"] for b in bars]; vol = [(b.get("volume") or 0) for b in bars]
+        e7, e17, e50 = _ema(cl, 7), _ema(cl, 17), _ema(cl, 50)
+        ml, ms = _macd(cl); rs = _rsi(cl); at = _atr(bars, 14)
+        orr = hi[0] - lo[0]
+        or_avg = (sum(or_hist[-20:]) / len(or_hist[-20:])) if or_hist else orr
+        rvr = orr / or_avg if or_avg else 1.0
+        or_hist.append(orr)
+        tot_v = sum(vol); cp = cv = 0.0; vw = []
+        for k, b in enumerate(bars):
+            tp = (b["high"] + b["low"] + b["close"]) / 3.0
+            w = vol[k] if tot_v > 0 else 1.0
+            cp += tp * w; cv += w
+            vw.append(cp / cv if cv else tp)
+
+        n = len(bars)
+        # NON-OVERLAPPING: step by fwd
+        for i in range(20, n - fwd - 1, fwd):
+            c = cl[i]
+            dh = max(hi[:i + 1]); dl = min(lo[:i + 1]); rng = dh - dl
+            w20 = cl[max(0, i - 20):i + 1]
+            mu = sum(w20) / len(w20)
+            sd = (sum((x - mu) ** 2 for x in w20) / len(w20)) ** 0.5
+            vsl = vol[max(0, i - 20):i]
+            vavg = (sum(vsl) / len(vsl)) if vsl else 0
+            rows.append({
+                "ret3": (c / cl[i - 3] - 1) * 10000,
+                "ret6": (c / cl[i - 6] - 1) * 10000,
+                "atr_bps": at[i] / c * 10000,
+                "vol20_bps": sd / c * 10000,
+                "d_vwap_bps": (c - vw[i]) / c * 10000,
+                "d_open_bps": (c - o) / o * 10000,
+                "d_pclose_bps": ((c / prev_close - 1) * 10000) if prev_close else 0.0,
+                "pos_day_rng": ((c - dl) / rng) if rng else 0.5,
+                "e7_e17_bps": (e7[i] - e17[i]) / c * 10000,
+                "e17_e50_bps": (e17[i] - e50[i]) / c * 10000,
+                "macd_hist_bps": (ml[i] - ms[i]) / c * 10000,
+                "rsi14": rs[i],
+                "open_rvr": rvr,
+                "rvol": (vol[i] / vavg) if vavg else 1.0,
+                "d_hi20_bps": (c - max(hi[max(0, i - 20):i + 1])) / c * 10000,
+                "d_lo20_bps": (c - min(lo[max(0, i - 20):i + 1])) / c * 10000,
+                "_y": (cl[i + fwd] / c - 1) * 10000,
+                "_bod": i, "_d": dk,
+            })
+        prev_close = cl[-1]
+
+    if len(rows) < 1000:
+        return jsonify({"error": "too few rows", "rows": len(rows)}), 500
+
+    if demean == "bod":
+        agg = {}
+        for r in rows:
+            agg.setdefault(r["_bod"], []).append(r["_y"])
+        means = {k: sum(v) / len(v) for k, v in agg.items()}
+        for r in rows:
+            r["_y"] -= means[r["_bod"]]
+
+    udk = sorted(set(r["_d"] for r in rows))
+    i1, i2 = int(len(udk) * 0.50), int(len(udk) * 0.75)
+    tr_d, va_d = set(udk[:i1]), set(udk[i1:i2])
+    tr = [r for r in rows if r["_d"] in tr_d]
+    va = [r for r in rows if r["_d"] in va_d]
+
+    feats = [k for k in rows[0] if not k.startswith("_")]
+    out, n_tests = [], 0
+    for fn in feats:
+        vals = sorted(r[fn] for r in tr)
+        cuts = [vals[int(len(vals) * (k + 1) / nq) - 1] for k in range(nq - 1)]
+
+        def bk(v):
+            for bi, cv_ in enumerate(cuts):
+                if v <= cv_:
+                    return bi
+            return nq - 1
+
+        for qi in range(nq):
+            n_tests += 1
+            a = [r["_y"] for r in tr if bk(r[fn]) == qi]
+            b = [r["_y"] for r in va if bk(r[fn]) == qi]
+            if len(a) < 100 or len(b) < 50:
+                continue
+            ma, ta = _tstat(a); mb, tb = _tstat(b)
+            if abs(ta) < min_t or ma * mb <= 0:
+                continue
+            out.append({"feature": fn, "quintile": qi + 1,
+                        "train_n": len(a), "train_mean_bps": round(ma, 2),
+                        "train_t": round(ta, 2),
+                        "val_n": len(b), "val_mean_bps": round(mb, 2),
+                        "val_t": round(tb, 2),
+                        "nifty_pts_equiv": round(mb / 10000 * 23500, 2)})
+    out.sort(key=lambda r: -abs(r["val_t"]))
+    return jsonify({
+        "src": src, "sessions": len(udk), "obs": len(rows),
+        "overlap": "none (step=%d)" % fwd, "demean": demean,
+        "fwd_bars": fwd,
+        "split": {"train_days": len(tr_d), "val_days": len(va_d),
+                  "holdout_days": len(udk) - i2, "holdout": "UNTOUCHED"},
+        "tests_run": n_tests,
+        "expected_false_positives": round(n_tests * 0.05, 1),
+        "survivors": len(out), "top": out[:20],
+    })
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
