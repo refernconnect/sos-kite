@@ -1650,6 +1650,138 @@ def ob3_route():
                     "overall": st(trades),
                     "by_opening_participation": buckets,
                     "sample": trades[-10:]})
+@app.route("/vw")
+def vw_route():
+    """VWAP-reclaim theory. Long only.
+
+    ?days=664 &gap=50 &pivot_n=2 &stop_pts=30 &need_hh=1
+    Entry: pivot high (higher than prior pivot) + close > EMA9 + VWAP-close >= gap
+    Add:   EMA9 crosses above VWAP
+    Exit:  close < EMA7 (and >= EMA9) -> 1 lot; close < EMA9 -> rest; stop; EOD
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+
+    g = request.args.get
+    days = int(g("days", 664)); gap = float(g("gap", 50.0))
+    pn = int(g("pivot_n", 2)); stop_pts = float(g("stop_pts", 30.0))
+    need_hh = g("need_hh", "1") == "1"
+
+    c5 = _by_day(_pull(NIFTY_TOKEN, days, "5minute"))
+    if not c5:
+        return jsonify({"error": "no 5m candles"}), 500
+
+    trades, vol_days, sig_days = [], 0, 0
+
+    for dk in sorted(c5.keys()):
+        bars = c5[dk]
+        if len(bars) < 20:
+            continue
+        cl = [b["close"] for b in bars]
+        e7, e9 = _ema(cl, 7), _ema(cl, 9)
+
+        tot_v = sum((b.get("volume") or 0) for b in bars)
+        if tot_v > 0:
+            vol_days += 1
+        cv = cp = 0.0
+        vw = []
+        for b in bars:
+            tp = (b["high"] + b["low"] + b["close"]) / 3.0
+            w = (b.get("volume") or 0) if tot_v > 0 else 1.0
+            cp += tp * w; cv += w
+            vw.append(cp / cv if cv else tp)
+
+        pivots = []
+        for i in range(pn, len(bars) - pn):
+            h = bars[i]["high"]
+            if all(bars[j]["high"] < h for j in range(i - pn, i)) and \
+               all(bars[j]["high"] < h for j in range(i + 1, i + pn + 1)):
+                pivots.append(i)
+
+        legs, fired = [], False
+        for pi in pivots:
+            ci = pi + pn
+            if ci >= len(bars) - 2 or fired:
+                continue
+            if need_hh:
+                prior = [p for p in pivots if p < pi]
+                if not prior or bars[pi]["high"] <= bars[prior[-1]]["high"]:
+                    continue
+            if cl[ci] <= e9[ci]:
+                continue
+            if (vw[ci] - cl[ci]) < gap:
+                continue
+
+            fired = True
+            sig_days += 1
+            legs = [{"entry": cl[ci], "i": ci, "leg": 1}]
+            added = False
+
+            for j in range(ci + 1, len(bars)):
+                if not legs:
+                    break
+                if not added and e9[j] > vw[j] and e9[j - 1] <= vw[j - 1]:
+                    legs.append({"entry": cl[j], "i": j, "leg": 2})
+                    added = True
+                    continue
+                c = cl[j]
+                for lg in list(legs):
+                    if (bars[j]["low"] - lg["entry"]) <= -stop_pts:
+                        trades.append({"date": dk, "leg": lg["leg"],
+                                       "pts": round(-stop_pts, 2), "why": "stop"})
+                        legs.remove(lg)
+                if not legs:
+                    break
+                if c < e9[j]:
+                    for lg in legs:
+                        trades.append({"date": dk, "leg": lg["leg"],
+                                       "pts": round(c - lg["entry"], 2),
+                                       "why": "ema9"})
+                    legs = []
+                    break
+                if c < e7[j] and len(legs) > 1:
+                    lg = legs.pop(0)
+                    trades.append({"date": dk, "leg": lg["leg"],
+                                   "pts": round(c - lg["entry"], 2), "why": "ema7"})
+            for lg in legs:
+                trades.append({"date": dk, "leg": lg["leg"],
+                               "pts": round(cl[-1] - lg["entry"], 2), "why": "eod"})
+
+    if not trades:
+        return jsonify({"sessions": len(c5), "signal_days": sig_days,
+                        "trades": 0, "vwap_source":
+                        "volume" if vol_days else "twap_no_volume"}), 200
+
+    p = sorted(t["pts"] for t in trades)
+    n = len(p)
+    w = [x for x in p if x > 0]; l = [x for x in p if x <= 0]
+    why = {}
+    for t in trades:
+        why[t["why"]] = why.get(t["why"], 0) + 1
+    l1 = [t["pts"] for t in trades if t["leg"] == 1]
+    l2 = [t["pts"] for t in trades if t["leg"] == 2]
+
+    return jsonify({
+        "sessions": len(c5), "signal_days": sig_days,
+        "vwap_source": "volume" if vol_days else "twap_no_volume",
+        "days_with_volume": vol_days,
+        "trades": n,
+        "win_rate_pct": round(len(w) / n * 100, 1),
+        "mean_pts": round(sum(p) / n, 2), "median_pts": round(p[n // 2], 2),
+        "total_pts": round(sum(p), 1),
+        "avg_win": round(sum(w) / len(w), 2) if w else None,
+        "avg_loss": round(sum(l) / len(l), 2) if l else None,
+        "best": p[-1], "worst": p[0],
+        "leg1": {"n": len(l1), "total": round(sum(l1), 1),
+                 "mean": round(sum(l1) / len(l1), 2)} if l1 else None,
+        "leg2": {"n": len(l2), "total": round(sum(l2), 1),
+                 "mean": round(sum(l2) / len(l2), 2)} if l2 else None,
+        "exit_reasons": why,
+        "params": {"gap": gap, "pivot_n": pn, "stop_pts": stop_pts,
+                   "need_hh": need_hh},
+        "sample": trades[-10:],
+    })
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
