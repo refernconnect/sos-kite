@@ -2483,6 +2483,178 @@ def scan2_route():
         "survivors": len(out), "top": out[:20],
     })
 
+_XS = {"state": "idle", "done": 0, "total": 0, "err": None, "rows": [], "started": None}
+
+
+@app.route("/xs_start")
+def xs_start_route():
+    """Cross-sectional opening-participation ORB across CAS-eligible F&O stocks.
+
+    ?days=400&limit=210&lookback=14
+    ORV = first 5m volume / mean first 5m volume of prior `lookback` sessions.
+    Each day: rank stocks by ORV. Direction from first 5m candle. Enter 09:20,
+    stop at opposite end of the opening range, exit at close. Returns in bps and R.
+    """
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+    if _XS["state"] == "running":
+        return jsonify({"state": "running", "done": _XS["done"],
+                        "total": _XS["total"]}), 200
+
+    days = int(request.args.get("days", 400))
+    limit = int(request.args.get("limit", 210))
+    lookback = int(request.args.get("lookback", 14))
+
+    def job():
+        try:
+            _XS.update({"state": "running", "done": 0, "total": 0,
+                        "err": None, "rows": [], "started": datetime.now(IST).isoformat()})
+            s = requests.Session()
+            s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                            "Chrome/124.0.0.0 Safari/537.36",
+                              "Accept": "*/*", "Accept-Encoding": "gzip, deflate"})
+            s.get("https://www.nseindia.com", timeout=12)
+            s.get("https://www.nseindia.com/market-data/closing-auction-session", timeout=12)
+            r = s.get("https://www.nseindia.com/api/NextApi/apiClient/casApi"
+                      "?functionName=getCASData",
+                      headers={"Referer": "https://www.nseindia.com/market-data/"
+                                          "closing-auction-session",
+                               "X-Requested-With": "XMLHttpRequest"}, timeout=15)
+            d = r.json().get("data") or []
+            d.sort(key=lambda x: x.get("finalValue") or 0, reverse=True)
+            uni = [x["symbol"] for x in d if x.get("symbol")][:limit]
+            if not uni:
+                raise ValueError("empty universe")
+
+            nse = kite.instruments("NSE")
+            tk = {x["tradingsymbol"]: x["instrument_token"] for x in nse
+                  if x.get("segment") == "NSE" and x.get("instrument_type") == "EQ"}
+            _XS["total"] = len(uni)
+
+            for sym in uni:
+                tok = tk.get(sym)
+                if not tok:
+                    _XS["done"] += 1
+                    continue
+                try:
+                    bars = _pull(tok, days, "5minute")
+                except Exception:
+                    _XS["done"] += 1
+                    continue
+                bd = _by_day(bars)
+                dks = sorted(bd.keys())
+                hist = []
+                for dk in dks:
+                    b = bd[dk]
+                    if len(b) < 20:
+                        continue
+                    f = b[0]
+                    v0 = f.get("volume") or 0
+                    if v0 <= 0:
+                        continue
+                    if len(hist) >= lookback:
+                        avg = sum(hist[-lookback:]) / lookback
+                        orv = v0 / avg if avg else None
+                    else:
+                        orv = None
+                    hist.append(v0)
+                    if orv is None:
+                        continue
+                    hi, lo = f["high"], f["low"]
+                    rng = hi - lo
+                    if rng <= 0:
+                        continue
+                    long_ = f["close"] > f["open"]
+                    if f["close"] == f["open"]:
+                        continue
+                    ent = b[1]["open"]
+                    stop = lo if long_ else hi
+                    risk = abs(ent - stop)
+                    if risk <= 0:
+                        continue
+                    ex, why = b[-1]["close"], "eod"
+                    for x in b[1:]:
+                        if long_ and x["low"] <= stop:
+                            ex, why = stop, "stop"; break
+                        if (not long_) and x["high"] >= stop:
+                            ex, why = stop, "stop"; break
+                    pnl = (ex - ent) if long_ else (ent - ex)
+                    _XS["rows"].append({
+                        "d": dk, "s": sym, "orv": round(orv, 3),
+                        "dir": 1 if long_ else -1,
+                        "bps": round(pnl / ent * 10000, 1),
+                        "r": round(pnl / risk, 3), "why": why})
+                _XS["done"] += 1
+            _XS["state"] = "done"
+        except Exception as e:
+            _XS["err"] = str(e)[:300]
+            _XS["state"] = "error"
+
+    threading.Thread(target=job, daemon=True).start()
+    return jsonify({"state": "started", "universe_limit": limit, "days": days}), 200
+
+
+@app.route("/xs_status")
+def xs_status_route():
+    """Progress, and results bucketed by daily ORV rank once complete. ?topn=20"""
+    topn = int(request.args.get("topn", 20))
+    base = {"state": _XS["state"], "done": _XS["done"], "total": _XS["total"],
+            "err": _XS["err"], "started_ist": _XS["started"],
+            "rows_collected": len(_XS["rows"])}
+    if _XS["state"] != "done":
+        return jsonify(base), 200
+
+    byday = {}
+    for r in _XS["rows"]:
+        byday.setdefault(r["d"], []).append(r)
+    ranked = []
+    for dk, rs in byday.items():
+        rs.sort(key=lambda x: -x["orv"])
+        for i, r in enumerate(rs):
+            r["rank"] = i + 1
+            ranked.append(r)
+
+    dks = sorted(byday.keys())
+    i1, i2 = int(len(dks) * 0.5), int(len(dks) * 0.75)
+    tr, va = set(dks[:i1]), set(dks[i1:i2])
+
+    def st(sel):
+        if len(sel) < 20:
+            return None
+        b = sorted(x["bps"] for x in sel)
+        rr = [x["r"] for x in sel]
+        n = len(b)
+        w = [x for x in b if x > 0]
+        return {"trades": n, "win_pct": round(len(w) / n * 100, 1),
+                "mean_bps": round(sum(b) / n, 1),
+                "median_bps": round(b[n // 2], 1),
+                "mean_R": round(sum(rr) / n, 3),
+                "total_R": round(sum(rr), 1),
+                "best_bps": b[-1], "worst_bps": b[0]}
+
+    buckets = {}
+    for lo_, hi_, lbl in ((1, 5, "rank_1_5"), (6, 10, "rank_6_10"),
+                          (11, 20, "rank_11_20"), (21, 50, "rank_21_50"),
+                          (51, 9999, "rank_51_plus")):
+        sel = [r for r in ranked if lo_ <= r["rank"] <= hi_]
+        buckets[lbl] = {"all": st(sel),
+                        "train": st([r for r in sel if r["d"] in tr]),
+                        "val": st([r for r in sel if r["d"] in va])}
+
+    topsel = [r for r in ranked if r["rank"] <= topn]
+    base.update({
+        "sessions": len(dks), "symbols": len(set(r["s"] for r in ranked)),
+        "split": {"train_days": len(tr), "val_days": len(va),
+                  "holdout_days": len(dks) - i2, "holdout": "UNTOUCHED"},
+        "top%d_all" % topn: st(topsel),
+        "top%d_train" % topn: st([r for r in topsel if r["d"] in tr]),
+        "top%d_val" % topn: st([r for r in topsel if r["d"] in va]),
+        "by_rank_bucket": buckets,
+        "unfiltered_all": st(ranked),
+    })
+    return jsonify(base)
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
