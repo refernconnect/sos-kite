@@ -3548,6 +3548,94 @@ def opt_status_route():
     return jsonify(base)
 
 
+
+@app.route("/vrp_dump")
+def vrp_dump_route():
+    """Per-night rows behind /vrp plus a proxy short-variance P&L and tail
+    summary. Proxy: implied daily variance from VIX at entry, allocated to the
+    night by calendar share; P&L = implied_alloc - realised r^2 (variance units
+    x1e4). The kill metric is worst_night_loss / mean_night_gain.
+    ?days=900&entry=15:20&exit=09:20"""
+    if not state.get("access_token"):
+        return jsonify({"error": "not logged in - do the Kite login first"}), 400
+    import math
+    g = request.args.get
+    days = int(g("days", 900)); entry_hhmm = g("entry", "15:20"); exit_hhmm = g("exit", "09:20")
+    try:
+        inst = kite.instruments("NSE")
+    except Exception as e:
+        return jsonify({"error": "instruments() failed: %s" % e}), 500
+    vix_tok = next((r["instrument_token"] for r in inst
+                    if (r.get("tradingsymbol") or "").upper().replace(" ", "")
+                    in ("INDIAVIX", "INDIAVIX-INDEX")), None)
+    if not vix_tok:
+        return jsonify({"error": "INDIA VIX token not found"}), 500
+    nif = _by_day(_pull(NIFTY_TOKEN, days, "5minute"))
+    vix = _by_day(_pull(vix_tok, days, "5minute"))
+    dks = sorted(set(nif.keys()) & set(vix.keys()))
+    rows = []
+    for i in range(1, len(dks)):
+        pd_, cd = dks[i - 1], dks[i]
+        pe, cx, ce = bar_at(nif[pd_], entry_hhmm), bar_at(nif[cd], exit_hhmm), bar_at(nif[cd], entry_hhmm)
+        vpe, vcx = bar_at(vix[pd_], entry_hhmm), bar_at(vix[cd], exit_hhmm)
+        if not (pe and cx and ce and vpe and vcx):
+            continue
+        r_on = math.log(cx["open"] / pe["open"]); r_id = math.log(ce["open"] / cx["open"])
+        h_on = (cx["date"] - pe["date"]).total_seconds() / 3600.0
+        h_id = (ce["date"] - cx["date"]).total_seconds() / 3600.0
+        if h_on <= 0 or h_id <= 0:
+            continue
+        iv_day_on = (vpe["open"] / 100.0) ** 2 / 365.0
+        iv_day_id = (vcx["open"] / 100.0) ** 2 / 365.0
+        alloc_on = iv_day_on * (h_on / 24.0)
+        alloc_id = iv_day_id * (h_id / 24.0)
+        rows.append({"d": cd, "dow": pe["date"].weekday(), "wk": h_on > 30,
+                     "vix": round(vpe["open"], 2), "h_on": round(h_on, 1),
+                     "r_on": round(r_on * 1e4, 2), "r_id": round(r_id * 1e4, 2),
+                     "pnl_on": round((alloc_on - r_on ** 2) * 1e4, 4),
+                     "pnl_id": round((alloc_id - r_id ** 2) * 1e4, 4)})
+
+    def tail(sel, key):
+        if len(sel) < 30:
+            return {"n": len(sel)}
+        v = [x[key] for x in sel]
+        n = len(v); s = sorted(v)
+        m, t = _tstat(v)
+        gains = [x for x in v if x > 0]
+        mg = sum(gains) / len(gains) if gains else 0
+        worst = s[0]
+        k1 = max(1, int(math.ceil(n * 0.01))); k5 = max(1, int(math.ceil(n * 0.05)))
+        neg_total = sum(x for x in v if x < 0)
+        cum, peak, dd = 0.0, 0.0, 0.0
+        for x in v:
+            cum += x; peak = max(peak, cum); dd = min(dd, cum - peak)
+        return {"n": n, "mean": round(m, 4), "t": round(t, 2), "total": round(sum(v), 3),
+                "win_pct": round(len(gains) / n * 100, 1),
+                "mean_gain_night": round(mg, 4), "worst_night": round(worst, 4),
+                "worst_night_eats_N_mean_gains": round(abs(worst) / mg, 1) if mg > 0 else None,
+                "worst1pct_share_of_all_losses": round(sum(s[:k1]) / neg_total, 2) if neg_total < 0 else None,
+                "worst5pct_share_of_all_losses": round(sum(s[:k5]) / neg_total, 2) if neg_total < 0 else None,
+                "total_ex_worst1pct": round(sum(s[k1:]), 3),
+                "max_drawdown": round(dd, 3),
+                "max_drawdown_in_mean_gains": round(abs(dd) / mg, 1) if mg > 0 else None}
+
+    lowv = sorted(x["vix"] for x in rows)[len(rows) // 2] if rows else None
+    filt = [x for x in rows if (not x["wk"]) and x["vix"] <= lowv] if lowv else []
+    return jsonify({
+        "sessions": len(rows), "vix_median": lowv,
+        "OVERNIGHT_all": tail(rows, "pnl_on"),
+        "INTRADAY_all": tail(rows, "pnl_id"),
+        "OVERNIGHT_weeknights": tail([x for x in rows if not x["wk"]], "pnl_on"),
+        "OVERNIGHT_weekends": tail([x for x in rows if x["wk"]], "pnl_on"),
+        "OVERNIGHT_FILTERED_weeknight_and_vix_below_median": tail(filt, "pnl_on"),
+        "OVERNIGHT_filtered_by_year": {y: tail([x for x in filt if x["d"][:4] == y], "pnl_on")
+                                       for y in sorted(set(x["d"][:4] for x in filt))},
+        "cols": ["d", "dow", "wk", "vix", "h_on", "r_on_bps", "r_id_bps", "pnl_on", "pnl_id"],
+        "rows": [[x["d"], x["dow"], x["wk"], x["vix"], x["h_on"], x["r_on"], x["r_id"], x["pnl_on"], x["pnl_id"]]
+                 for x in rows],
+    })
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, threaded=True)
